@@ -1,0 +1,54 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Swift Package Manager and compiler output
+/.build/
+/Packages/
+/.swiftpm/
+*.dSYM/
+*.dSYM.zip
+*.profdata
+
+# Xcode user and build data
+/DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+
+# Generated application and release artifacts
+/dist/
+/.kvist-package/
+/*.app/
+/*.zip
+/*.dmg
+/*.pkg
+/*.xcarchive/
+
+# Generated benchmark runs (curated references live in Benchmarks/Baselines)
+/Benchmarks/Results/
+
+# Editor and language-server state
+/.idea/
+/.vscode/
+/.sourcekit-lsp/
+*.swp
+*.swo
+*~
+
+# Local logs and environment overrides
+*.log
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Signing credentials and provisioning profiles
+*.cer
+*.p12
+*.mobileprovision
+*.provisionprofile

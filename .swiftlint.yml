@@ -1,0 +1,18 @@
+excluded:
+  - .build
+  - dist
+
+# These metrics do not fit the app's deliberately consolidated SwiftUI views,
+# benchmark fixtures, and embedded SVG data. Keep the rules that find concrete
+# style and API issues enabled.
+disabled_rules:
+  - cyclomatic_complexity
+  - file_length
+  - function_body_length
+  - function_parameter_count
+  - identifier_name
+  - large_tuple
+  - line_length
+  - nesting
+  - type_body_length
+  - type_name
