@@ -1,7 +1,7 @@
 # Distributing Kvist
 
 Kvist's supported public release path is a Developer ID-signed and notarized
-direct download for macOS 14 or later.
+direct download for macOS 26 or later.
 
 ## Prerequisites
 
