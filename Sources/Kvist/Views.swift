@@ -3653,6 +3653,20 @@ private struct FileSection: View {
                 )
 
                 if !changes.isEmpty {
+                    if title == "Changes" {
+                        IconButton(
+                            symbol: "arrow.uturn.backward",
+                            help: "Discard All Unstaged Changes",
+                            size: 13
+                        ) {
+                            guard GitPrompt.confirmDiscardAllUnstagedChanges() else { return }
+                            Task { await model.discardAllUnstagedChanges() }
+                        }
+                        .disabled(actionsDisabled || model.hasUnresolvedConflicts)
+                        .opacity(hovering ? 1 : 0)
+                        .allowsHitTesting(hovering)
+                    }
+
                     IconButton(
                         symbol: title == "Changes" ? "plus" : "minus",
                         help: title == "Changes"
@@ -3712,11 +3726,21 @@ private struct FileSection: View {
                     .disabled(!model.hasChanges || model.headHash == nil || actionsDisabled)
                 }
             }
-            .accessibilityAction(
-                named: Text(title == "Changes" ? "Stage All Changes" : "Unstage All Changes")
-            ) {
-                guard !changes.isEmpty, !actionsDisabled else { return }
-                action()
+            .accessibilityActions {
+                Button(title == "Changes" ? "Stage All Changes" : "Unstage All Changes") {
+                    guard !changes.isEmpty, !actionsDisabled else { return }
+                    action()
+                }
+
+                if title == "Changes" {
+                    Button("Discard All Unstaged Changes") {
+                        guard !changes.isEmpty,
+                              !actionsDisabled,
+                              !model.hasUnresolvedConflicts,
+                              GitPrompt.confirmDiscardAllUnstagedChanges() else { return }
+                        Task { await model.discardAllUnstagedChanges() }
+                    }
+                }
             }
 
             if expanded {
@@ -6143,6 +6167,18 @@ private enum GitPrompt {
             actions: [
                 AppDialogAction(title: "Cancel", role: .cancel),
                 AppDialogAction(title: "Discard All", role: .destructive)
+            ]
+        )
+        return result.actionIndex == 1
+    }
+
+    static func confirmDiscardAllUnstagedChanges() -> Bool {
+        let result = AppDialog.run(
+            title: "Discard All Unstaged Changes?",
+            message: "Permanently discard every unstaged change, including untracked files and folders. Staged and ignored files are kept. This cannot be undone by Kvist.",
+            actions: [
+                AppDialogAction(title: "Cancel", role: .cancel),
+                AppDialogAction(title: "Discard Unstaged", role: .destructive)
             ]
         )
         return result.actionIndex == 1

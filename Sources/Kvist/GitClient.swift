@@ -1267,6 +1267,20 @@ struct GitClient: Sendable {
         }
     }
 
+    func discardAllUnstagedChanges() throws {
+        let changes = try workingTreeSnapshot().unstaged
+        if changes.contains(where: { $0.status != "U" }) {
+            do {
+                _ = try run(["restore", "--worktree", "."])
+            } catch {
+                _ = try run(["checkout", "--", "."])
+            }
+        }
+        if changes.contains(where: { $0.status == "U" }) {
+            _ = try run(["clean", "-fd"])
+        }
+    }
+
     func discardAllChanges() throws {
         _ = try run(["reset", "--hard", "HEAD"])
         _ = try run(["clean", "-fd"])

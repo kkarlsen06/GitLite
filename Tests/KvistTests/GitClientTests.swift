@@ -435,6 +435,28 @@ final class GitClientTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: untrackedURL.path))
     }
 
+    func testDiscardAllUnstagedChangesKeepsStagedChanges() throws {
+        let client = GitClient(repositoryURL: repositoryURL)
+        let trackedURL = repositoryURL.appendingPathComponent("tracked.txt")
+        try "original\n".write(to: trackedURL, atomically: true, encoding: .utf8)
+        try client.stageAll()
+        _ = try client.commit(message: "Add tracked file")
+
+        try "staged\n".write(to: trackedURL, atomically: true, encoding: .utf8)
+        try client.stageAll()
+        try "unstaged\n".write(to: trackedURL, atomically: true, encoding: .utf8)
+        let untrackedURL = repositoryURL.appendingPathComponent("untracked.txt")
+        try "temporary\n".write(to: untrackedURL, atomically: true, encoding: .utf8)
+
+        try client.discardAllUnstagedChanges()
+
+        let snapshot = try client.snapshot()
+        XCTAssertEqual(snapshot.staged.map(\.path), ["tracked.txt"])
+        XCTAssertTrue(snapshot.unstaged.isEmpty)
+        XCTAssertEqual(try String(contentsOf: trackedURL, encoding: .utf8), "staged\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: untrackedURL.path))
+    }
+
     func testResetModesMoveBranchAndHandleWorkingTree() throws {
         let client = GitClient(repositoryURL: repositoryURL)
         let fileURL = repositoryURL.appendingPathComponent("file.txt")

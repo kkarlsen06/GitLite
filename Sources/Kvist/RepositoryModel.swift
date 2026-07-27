@@ -2325,6 +2325,13 @@ final class RepositoryModel: ObservableObject {
         )
     }
 
+    func discardAllUnstagedChanges() async {
+        guard !unstaged.isEmpty else { return }
+        await perform("Discarding all unstaged changes…") {
+            try $0.discardAllUnstagedChanges()
+        }
+    }
+
     func discardAllChanges() async {
         guard hasChanges, headHash != nil else { return }
         await perform("Discarding all changes…") {
