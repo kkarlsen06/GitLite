@@ -173,9 +173,7 @@ final class RepositoryModel: ObservableObject {
                 }
             }
             scheduleRepositoryFileDirtyReconciliation()
-            if isFileSearchPresented, !repositorySearchQuery.isEmpty {
-                scheduleRepositorySearch()
-            }
+            refreshEditedFileSearchMatches()
             restorationStateDidChange?()
         }
     }
@@ -1791,6 +1789,34 @@ final class RepositoryModel: ObservableObject {
                 isDetailLoading = false
             }
         }
+    }
+
+    /// Re-derives the open editor's text matches from the in-memory buffer so
+    /// typing never re-runs (and never blanks) the repository-wide search.
+    private func refreshEditedFileSearchMatches() {
+        let query = repositorySearchQuery
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isFileSearchPresented,
+              !query.isEmpty,
+              let editedPath = selectedRepositoryFilePath else { return }
+
+        let existing = repositorySearchResults
+        let editedMatches = RepositorySearchParser.textMatches(
+            in: repositoryFileText,
+            path: editedPath,
+            query: query,
+            limit: 20
+        )
+        let textMatches = existing.textMatches.filter {
+            $0.path != editedPath
+        } + editedMatches
+        guard textMatches != existing.textMatches else { return }
+        repositorySearchResults = RepositorySearchResults(
+            fileMatches: existing.fileMatches,
+            textMatches: textMatches,
+            fileMatchesWereLimited: existing.fileMatchesWereLimited,
+            textMatchesWereLimited: existing.textMatchesWereLimited
+        )
     }
 
     private func scheduleRepositorySearch(presentsResults: Bool = true) {
