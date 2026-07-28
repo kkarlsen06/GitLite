@@ -185,4 +185,29 @@ enum RepositorySearchParser {
         }
         return (matches, wasLimited)
     }
+
+    static func textMatches(
+        in text: String,
+        path: String,
+        query: String,
+        limit: Int
+    ) -> [RepositoryTextSearchMatch] {
+        guard limit > 0 else { return [] }
+        return text.components(separatedBy: "\n").enumerated().compactMap {
+            line, contents in
+            guard contents.range(of: query, options: .caseInsensitive) != nil else {
+                return nil
+            }
+            return RepositoryTextSearchMatch(
+                path: path,
+                line: line + 1,
+                preview: String(
+                    contents.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .prefix(300)
+                )
+            )
+        }
+        .prefix(limit)
+        .map(\.self)
+    }
 }

@@ -3,6 +3,27 @@ import XCTest
 @testable import Kvist
 
 final class AICommitMessagePreferencesTests: XCTestCase {
+    func testAICommitMessageSSHCommandUsesRemoteRepository() throws {
+        let repository = try SSHRepository(
+            host: "deploy@example.com",
+            path: "/srv/project with spaces"
+        )
+
+        XCTAssertEqual(
+            AICommitMessageGenerator.sshArguments(
+                for: repository,
+                command: "codex exec"
+            ),
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "deploy@example.com",
+                "--",
+                "cd '/srv/project with spaces' && codex exec"
+            ]
+        )
+    }
+
     func testConfigurationKeepsProviderSpecificModelsAndCommands() throws {
         let suiteName = "AICommitMessagePreferencesTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

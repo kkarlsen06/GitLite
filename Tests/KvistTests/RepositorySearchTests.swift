@@ -115,6 +115,23 @@ final class RepositorySearchTests: XCTestCase {
         XCTAssertTrue(parsed.wasLimited)
     }
 
+    func testSearchParserUsesCurrentEditorLineNumbers() {
+        let matches = RepositorySearchParser.textMatches(
+            in: "inserted\nfirst\nNeedle here\nlast",
+            path: "App.swift",
+            query: "needle",
+            limit: 20
+        )
+
+        XCTAssertEqual(matches, [
+            RepositoryTextSearchMatch(
+                path: "App.swift",
+                line: 3,
+                preview: "Needle here"
+            )
+        ])
+    }
+
     @MainActor
     func testSearchPanelPreservesAndReturnsToOpenEditor() async throws {
         let fileURL = repositoryURL.appendingPathComponent("Answer.swift")

@@ -41,6 +41,10 @@ struct RepositoryFileBrowser: View {
 
             Spacer()
 
+            if model.sshRepository != nil {
+                RepositoryReloadButton()
+            }
+
             Button {
                 model.toggleRepositorySearch()
             } label: {
@@ -229,7 +233,9 @@ struct RepositoryFileBrowser: View {
         isLoading = true
         loadError = nil
         do {
-            let loaded = try await RepositoryFileLoader.loadChildren(of: repositoryURL)
+            let loaded = try await model.repositoryFileChildren(
+                at: repositoryURL
+            )
             guard !Task.isCancelled,
                   model.repositoryURL == repositoryURL else {
                 isLoading = false
@@ -245,6 +251,26 @@ struct RepositoryFileBrowser: View {
             loadError = "Could not load this repository’s files."
         }
         isLoading = false
+    }
+}
+
+struct RepositoryReloadButton: View {
+    @EnvironmentObject private var model: RepositoryModel
+
+    var body: some View {
+        Button {
+            Task { await model.refresh() }
+        } label: {
+            Image(systemName: "arrow.clockwise")
+                .font(.system(size: 13, weight: .medium))
+                .frame(width: 24, height: 26)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(AppTheme.secondary)
+        .disabled(model.isBusy)
+        .accessibilityLabel("Reload SSH Repository")
+        .help("Reload SSH Repository (⌘R)")
     }
 }
 
@@ -420,8 +446,8 @@ private struct RepositoryFileTreeRow: View {
         isLoadingChildren = true
         childrenLoadFailed = false
         do {
-            let loaded = try await RepositoryFileLoader.loadChildren(
-                of: item.url,
+            let loaded = try await model.repositoryFileChildren(
+                at: item.url,
                 parentRelativePath: item.relativePath
             )
             guard !Task.isCancelled, isExpanded else {

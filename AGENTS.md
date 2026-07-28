@@ -2,6 +2,23 @@
 
 Always install the newest build to /Applications after making changes.
 
+## Modal dialogs
+
+Use `AppDialog` (`NSAlert`) for prompts and confirmations, and `NSOpenPanel` or
+`NSSavePanel` for filesystem choices. Do not implement modals with a borderless
+`NSPanel` containing an `NSHostingView` and `NSApp.runModal`: when attached to
+the SwiftUI window it may render correctly without receiving mouse events.
+
+The affected input prompts are stash, create/rename branch, clone repository,
+open over SSH, add/edit/link remote, and create tag. Keep them on the shared
+`AppDialog` path. The “Save Changes?” prompt is the known-good reference: its
+disclosure content is an `NSAlert` accessory view.
+
+For `NSAlert` accessory forms, give text fields an explicit width and size the
+accessory stack with `fittingSize`; guessed heights or intrinsic placeholder
+widths clip multi-row forms. Clear the Return key equivalent on destructive
+buttons unless a primary action is present.
+
 ## Tab performance benchmark
 
 Run `Scripts/benchmark-tabs.sh` after changes to repository tabs, workspace

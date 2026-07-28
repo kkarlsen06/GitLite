@@ -403,8 +403,47 @@ struct PredictedMergeConflictError: LocalizedError, Sendable {
     }
 }
 
+struct SSHRepository: Codable, Equatable, Sendable {
+    let host: String
+    let path: String
+
+    init(host: String, path: String) throws {
+        let host = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowedHostCharacters = CharacterSet.alphanumerics.union(
+            CharacterSet(charactersIn: "@._-")
+        )
+        guard !host.isEmpty,
+              host.unicodeScalars.allSatisfy(allowedHostCharacters.contains),
+              path.hasPrefix("/") else {
+            throw GitCommandError(
+                command: "ssh",
+                output: "Enter an SSH host such as user@example.com and an absolute repository path."
+            )
+        }
+        self.host = host
+        self.path = path
+    }
+
+    var displayName: String {
+        URL(fileURLWithPath: path).lastPathComponent
+    }
+}
+
+struct SSHFileEntry: Sendable {
+    let name: String
+    let isDirectory: Bool
+    let isSymbolicLink: Bool
+}
+
 struct GitClient: Sendable {
     let repositoryURL: URL
+    let sshRepository: SSHRepository?
+
+    init(repositoryURL: URL, sshRepository: SSHRepository? = nil) {
+        self.repositoryURL = repositoryURL
+        self.sshRepository = sshRepository
+    }
 
     private static let commandEnvironment: [String: String] = makeCommandEnvironment(
         baseEnvironment: ProcessInfo.processInfo.environment,
@@ -603,6 +642,86 @@ struct GitClient: Sendable {
             throw GitCommandError(command: "git rev-parse --show-toplevel", output: "That folder is not inside a Git repository.")
         }
         return URL(fileURLWithPath: root, isDirectory: true)
+    }
+
+    func validateSSHRepository() throws {
+        guard sshRepository != nil else { return }
+        let root = try run(["rev-parse", "--show-toplevel"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard root == sshRepository?.path else {
+            throw GitCommandError(
+                command: "git rev-parse --show-toplevel",
+                output: "The SSH path must be the repository root. Git reported \(root)."
+            )
+        }
+    }
+
+    func sshDirectoryEntries(relativePath: String) throws -> [SSHFileEntry] {
+        guard let sshRepository else { return [] }
+        let directory = URL(fileURLWithPath: sshRepository.path)
+            .appendingPathComponent(relativePath)
+            .path
+        let command = """
+        find \(Self.shellQuote(directory)) -mindepth 1 -maxdepth 1 -exec sh -c '\
+        for item do \
+        if [ -L "$item" ]; then type=l; \
+        elif [ -d "$item" ]; then type=d; \
+        else type=f; fi; \
+        printf "%s\\0%s\\0" "$type" "${item##*/}"; \
+        done' sh {} +
+        """
+        return Self.parseSSHDirectoryEntries(try runSSH(command))
+    }
+
+    static func parseSSHDirectoryEntries(_ data: Data) -> [SSHFileEntry] {
+        let fields = data
+            .split(separator: 0, omittingEmptySubsequences: false)
+            .dropLast()
+        return stride(from: 0, to: fields.count, by: 2).compactMap { index in
+            guard index + 1 < fields.count,
+                  let type = String(data: fields[index], encoding: .utf8),
+                  let name = String(data: fields[index + 1], encoding: .utf8),
+                  name != ".git" else { return nil }
+            return SSHFileEntry(
+                name: name,
+                isDirectory: type == "d",
+                isSymbolicLink: type == "l"
+            )
+        }
+        .sorted {
+            if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    func downloadSSHFile(relativePath: String, to fileURL: URL) throws {
+        guard let sshRepository else { return }
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let remotePath = URL(fileURLWithPath: sshRepository.path)
+            .appendingPathComponent(relativePath)
+            .path
+        try runRsync([
+            "-a",
+            "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10",
+            "\(sshRepository.host):\(Self.shellQuote(remotePath))",
+            fileURL.path
+        ])
+    }
+
+    func uploadSSHFile(_ fileURL: URL, relativePath: String) throws {
+        guard let sshRepository else { return }
+        let remotePath = URL(fileURLWithPath: sshRepository.path)
+            .appendingPathComponent(relativePath)
+            .path
+        try runRsync([
+            "-a",
+            "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10",
+            fileURL.path,
+            "\(sshRepository.host):\(Self.shellQuote(remotePath))"
+        ])
     }
 
     func snapshot(
@@ -1035,6 +1154,7 @@ struct GitClient: Sendable {
     }
 
     func repositoryWatchPaths() throws -> [String] {
+        if sshRepository != nil { return [] }
         try Task.checkCancellation()
         let root = repositoryURL.standardizedFileURL
         let paths = try run([
@@ -1248,6 +1368,10 @@ struct GitClient: Sendable {
 
     func discard(_ path: String, isUntracked: Bool) throws {
         if isUntracked {
+            if sshRepository != nil {
+                _ = try run(["clean", "-f", "--", path])
+                return
+            }
             let root = repositoryURL.standardizedFileURL
             let target = root.appendingPathComponent(path).standardizedFileURL
             guard target.path.hasPrefix(root.path + "/") else {
@@ -3013,15 +3137,30 @@ struct GitClient: Sendable {
         let process = Process()
         let outputPipe = Pipe()
 
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = [
+        let gitArguments = [
             "-c", "core.quotepath=false",
             // Kvist owns refresh scheduling, so a command-triggered detached
             // maintenance process only adds contention and self-watcher events.
             "-c", "maintenance.auto=false",
             "-c", "gc.auto=0"
         ] + arguments
-        process.currentDirectoryURL = repositoryURL
+        if let sshRepository {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            process.arguments = [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                sshRepository.host,
+                "--",
+                Self.remoteCommand(
+                    path: sshRepository.path,
+                    gitArguments: gitArguments
+                )
+            ]
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = gitArguments
+            process.currentDirectoryURL = repositoryURL
+        }
         process.environment = Self.commandEnvironment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = outputPipe
@@ -3076,6 +3215,81 @@ struct GitClient: Sendable {
         return output
     }
 
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func remoteCommand(path: String, gitArguments: [String]) -> String {
+        ([
+            "env",
+            "LC_ALL=C",
+            "LANG=C",
+            "GIT_OPTIONAL_LOCKS=0",
+            "GIT_TERMINAL_PROMPT=0",
+            "GCM_INTERACTIVE=Never",
+            "GIT_EDITOR=true",
+            "GIT_SEQUENCE_EDITOR=true",
+            "GIT_MERGE_AUTOEDIT=no",
+            "GIT_PAGER=cat",
+            "git",
+            "-C",
+            path
+        ] + gitArguments)
+            .map(shellQuote)
+            .joined(separator: " ")
+    }
+
+    private func runSSH(_ command: String) throws -> Data {
+        guard let sshRepository else { return Data() }
+        let process = Process()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = [
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            sshRepository.host,
+            "--", command
+        ]
+        process.environment = Self.commandEnvironment
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        try process.run()
+        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let error = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        try Task.checkCancellation()
+        guard process.terminationStatus == 0 else {
+            throw GitCommandError(
+                command: "ssh",
+                output: String(data: error, encoding: .utf8) ?? ""
+            )
+        }
+        return output
+    }
+
+    private func runRsync(_ arguments: [String]) throws {
+        let process = Process()
+        let outputPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/rsync")
+        process.arguments = arguments
+        process.environment = Self.commandEnvironment
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+        try process.run()
+        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        try Task.checkCancellation()
+        guard process.terminationStatus == 0 else {
+            throw GitCommandError(
+                command: "rsync",
+                output: String(data: output, encoding: .utf8) ?? ""
+            )
+        }
+    }
+
     func writePreviewBlob(object: String, to outputURL: URL) throws {
         let process = Process()
         let errorPipe = Pipe()
@@ -3089,14 +3303,29 @@ struct GitClient: Sendable {
         let outputHandle = try FileHandle(forWritingTo: outputURL)
         defer { try? outputHandle.close() }
 
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = [
+        let gitArguments = [
             "-c", "core.quotepath=false",
             "-c", "maintenance.auto=false",
             "-c", "gc.auto=0",
             "cat-file", "blob", object
         ]
-        process.currentDirectoryURL = repositoryURL
+        if let sshRepository {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            process.arguments = [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                sshRepository.host,
+                "--",
+                Self.remoteCommand(
+                    path: sshRepository.path,
+                    gitArguments: gitArguments
+                )
+            ]
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = gitArguments
+            process.currentDirectoryURL = repositoryURL
+        }
         process.environment = Self.commandEnvironment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = outputHandle

@@ -189,6 +189,21 @@ struct BranchGlyph: View {
         CodiconGlyph(icon: .gitBranch, size: size, color: color)
     }
 }
+
+struct SSHLogo: View {
+    private static let image = Bundle.module.url(
+        forResource: "Unofficial_SSH_Logo",
+        withExtension: "svg"
+    ).flatMap(NSImage.init(contentsOf:))
+
+    var body: some View {
+        if let image = Self.image {
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.high)
+        }
+    }
+}
 struct ContentView: View {
     @EnvironmentObject private var tabsModel: WorkspaceTabsModel
 
@@ -2472,6 +2487,19 @@ private struct WelcomeView: View {
                         || model.hasPendingChangeOperations
                 )
                 .help("Clone a remote repository into a local folder")
+
+                Button("Open Repository over SSH…") {
+                    openSSHRepository()
+                }
+                .buttonStyle(.plain)
+                .font(AppType.rowDetail)
+                .foregroundStyle(AppTheme.secondary)
+                .disabled(
+                    model.isBusy
+                        || model.isGeneratingCommitMessage
+                        || model.hasPendingChangeOperations
+                )
+                .help("Run Git directly in a repository on a remote machine")
             }
 
             if !recentRepositories.isEmpty {
@@ -2507,6 +2535,13 @@ private struct WelcomeView: View {
                 }
             }
             return true
+        }
+    }
+
+    private func openSSHRepository() {
+        guard let location = GitPrompt.sshRepository() else { return }
+        Task {
+            await model.openSSHRepository(host: location.host, path: location.path)
         }
     }
 
@@ -2836,6 +2871,12 @@ private struct RepositoryTabItem: View {
                 tabsModel.select(tabID)
             } label: {
                 HStack(spacing: 5) {
+                    if tab.isSSH {
+                        SSHLogo()
+                            .frame(width: 14, height: 14)
+                            .accessibilityHidden(true)
+                    }
+
                     Text(tabName)
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(1)
@@ -3262,6 +3303,11 @@ private struct ChangesActionBar: View {
 
             Spacer()
 
+            if model.sshRepository != nil {
+                RepositoryReloadButton()
+                    .padding(.trailing, 4)
+            }
+
             RepositoryTerminalButton()
 
             RepositoryLocationMenu()
@@ -3370,23 +3416,25 @@ private struct CommitMessageInput: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            ZStack(alignment: .leading) {
+            ZStack(alignment: .topLeading) {
                 if messageState.text.isEmpty {
                     Text("Message (⌘Enter to commit on \"\(model.branch)\")")
                         .font(AppType.row)
                         .foregroundStyle(AppTheme.muted)
                         .lineLimit(1)
+                        .padding(.leading, 5)
+                        .padding(.top, 5)
                         .allowsHitTesting(false)
                 }
 
-                TextField("", text: $messageState.text, axis: .vertical)
-                    .textFieldStyle(.plain)
+                TextEditor(text: $messageState.text)
                     .font(AppType.row)
                     .foregroundStyle(AppTheme.primary)
+                    .scrollContentBackground(.hidden)
+                    .autocorrectionDisabled()
                     .accessibilityLabel("Commit message")
                     .focused($focused)
-                    .lineLimit(1...10)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(height: 54)
                     .disabled(
                         model.isBusy
                             || model.isSavingRepositoryFile
@@ -6241,6 +6289,23 @@ private enum GitPrompt {
               let value = result.values.first,
               !value.isEmpty else { return nil }
         return value
+    }
+
+    static func sshRepository() -> (host: String, path: String)? {
+        let result = AppDialog.run(
+            title: "Open Repository over SSH",
+            message: "Kvist uses your existing SSH config and keys to run Git on the remote machine.",
+            fields: [
+                AppDialogField(label: "SSH host", placeholder: "user@example.com"),
+                AppDialogField(label: "Repository path", placeholder: "/srv/repository")
+            ],
+            actions: [
+                AppDialogAction(title: "Cancel", role: .cancel),
+                AppDialogAction(title: "Open Repository", role: .primary)
+            ]
+        )
+        guard result.actionIndex == 1, result.values.count == 2 else { return nil }
+        return (result.values[0], result.values[1])
     }
 
     static func cloneDestinationFolder() -> URL? {

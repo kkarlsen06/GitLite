@@ -22,6 +22,32 @@ final class GitClientTests: XCTestCase {
         try? FileManager.default.removeItem(at: repositoryURL)
     }
 
+    func testSSHRepositoryRequiresSafeHostAndAbsolutePath() throws {
+        XCTAssertEqual(
+            try SSHRepository(host: "deploy@example.com", path: "/srv/app"),
+            try SSHRepository(host: "deploy@example.com", path: "/srv/app")
+        )
+        XCTAssertThrowsError(
+            try SSHRepository(host: "example.com; touch /tmp/pwned", path: "/srv/app")
+        )
+        XCTAssertThrowsError(
+            try SSHRepository(host: "example.com", path: "srv/app")
+        )
+    }
+
+    func testSSHDirectoryEntriesPreserveNamesAndHideGitMetadata() throws {
+        let data = try XCTUnwrap(
+            "d\u{0}Sources\u{0}f\u{0}line\nbreak.txt\u{0}l\u{0}link\u{0}d\u{0}.git\u{0}"
+                .data(using: .utf8)
+        )
+
+        let entries = GitClient.parseSSHDirectoryEntries(data)
+
+        XCTAssertEqual(entries.map(\.name), ["Sources", "line\nbreak.txt", "link"])
+        XCTAssertEqual(entries.map(\.isDirectory), [true, false, false])
+        XCTAssertEqual(entries.map(\.isSymbolicLink), [false, false, true])
+    }
+
     func testRebaseConflictErrorUsesStructuredPresentation() throws {
         let output = """
         Rebasing (1/1)

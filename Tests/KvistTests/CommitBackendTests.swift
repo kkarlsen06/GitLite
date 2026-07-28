@@ -102,6 +102,39 @@ final class CommitBackendTests: XCTestCase {
         XCTAssertTrue(try client.commitDiff(hash: amendedHash).contains("+second"))
     }
 
+    @MainActor
+    func testAmendLoadsPreviousMessageBeforeEditing() async throws {
+        try commitFile(
+            path: "amend-message.txt",
+            contents: "content\n",
+            message: "Previous message"
+        )
+        let originalHash = try headHash()
+        let model = RepositoryModel(
+            restoresLastRepository: false,
+            persistsLastRepository: false,
+            monitoringEnabled: false
+        )
+        await model.openRepository(repositoryURL)
+
+        await model.amend()
+
+        XCTAssertEqual(model.commitMessage, "Previous message")
+        XCTAssertTrue(model.isAmendingCommit)
+        XCTAssertEqual(model.primaryActionTitle, "Amend Last Commit")
+        XCTAssertTrue(model.primaryActionEnabled)
+        XCTAssertEqual(try headHash(), originalHash)
+
+        model.commitMessage = "Edited message"
+        await model.performPrimaryAction()
+
+        XCTAssertEqual(
+            try GitClient(repositoryURL: repositoryURL).commitMessage(hash: headHash()),
+            "Edited message"
+        )
+        XCTAssertFalse(model.isAmendingCommit)
+    }
+
     func testBranchTagReferenceAndCheckoutOperations() throws {
         let client = GitClient(repositoryURL: repositoryURL)
         try commitFile(path: "base.txt", contents: "base\n", message: "Base")

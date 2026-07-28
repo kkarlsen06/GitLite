@@ -13,6 +13,7 @@ final class RepositoryTab: ObservableObject, Identifiable {
     fileprivate var restorationDidChange: (() -> Void)?
     fileprivate var modelDidInitialize: ((RepositoryModel) -> Void)?
     @Published private(set) var hasChanges = false
+    @Published private(set) var isSSH = false
     @Published private(set) var isRepositoryLoadPending: Bool
 
     init(
@@ -143,6 +144,10 @@ final class RepositoryTab: ObservableObject, Identifiable {
             .removeDuplicates()
             .sink { [weak self] in self?.hasChanges = $0 }
             .store(in: &restorationSubscriptions)
+        model.$sshRepository
+            .map { $0 != nil }
+            .removeDuplicates()
+            .assign(to: &$isSSH)
     }
 }
 private struct RestoredRepositoryTab: Codable {

@@ -105,6 +105,7 @@ struct RepositoryErrorPresentation: Equatable {
 @MainActor
 final class RepositoryModel: ObservableObject {
     @Published private(set) var repositoryURL: URL?
+    @Published private(set) var sshRepository: SSHRepository?
     @Published private(set) var repositoryInitializationURL: URL?
     private(set) var deferredRepositoryOpenURL: URL?
     @Published private(set) var branch = ""
@@ -172,6 +173,9 @@ final class RepositoryModel: ObservableObject {
                 }
             }
             scheduleRepositoryFileDirtyReconciliation()
+            if isFileSearchPresented, !repositorySearchQuery.isEmpty {
+                scheduleRepositorySearch()
+            }
             restorationStateDidChange?()
         }
     }
@@ -182,6 +186,7 @@ final class RepositoryModel: ObservableObject {
     @Published private(set) var isDiffPanelPresented = false
     @Published private(set) var isBusy = false
     @Published private(set) var isSyncing = false
+    @Published private(set) var isAmendingCommit = false
     @Published private(set) var pendingChangePaths: Set<String> = []
     @Published private(set) var isGeneratingCommitMessage = false
     @Published private(set) var activity = "Ready"
@@ -428,6 +433,9 @@ final class RepositoryModel: ObservableObject {
     }
 
     var primaryAction: PrimaryRepositoryAction {
+        if isAmendingCommit {
+            return .commit
+        }
         if hasChanges {
             return .commit
         }
@@ -445,6 +453,7 @@ final class RepositoryModel: ObservableObject {
     var primaryActionTitle: String {
         switch primaryAction {
         case .commit:
+            if isAmendingCommit { return "Amend Last Commit" }
             guard hasChanges else { return "Commit" }
             if hasStagedChanges { return "Commit Staged Changes" }
             switch UserDefaults.standard.integer(forKey: "smartCommitPreference") {
@@ -466,6 +475,10 @@ final class RepositoryModel: ObservableObject {
               !hasPendingChangeOperations else { return false }
         switch primaryAction {
         case .commit:
+            if isAmendingCommit {
+                return headHash != nil
+                    && !commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
             if hasStagedChanges { return true }
             return hasChanges
                 && UserDefaults.standard.integer(forKey: "smartCommitPreference") != 2
@@ -631,6 +644,40 @@ final class RepositoryModel: ObservableObject {
     }
 
     func openRepository(_ url: URL) async {
+        let marker = url.appendingPathComponent(".kvist-ssh")
+        if let data = try? Data(contentsOf: marker),
+           let sshRepository = try? JSONDecoder().decode(SSHRepository.self, from: data) {
+            await openRepository(url, overSSH: sshRepository)
+            return
+        }
+        await openRepository(url, overSSH: nil)
+    }
+
+    func openSSHRepository(host: String, path: String) async {
+        do {
+            let sshRepository = try SSHRepository(host: host, path: path)
+            let base = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            )[0]
+                .appendingPathComponent("Kvist/SSH", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                .appendingPathComponent(sshRepository.displayName, isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: base,
+                withIntermediateDirectories: true
+            )
+            try JSONEncoder().encode(sshRepository).write(
+                to: base.appendingPathComponent(".kvist-ssh"),
+                options: .atomic
+            )
+            await openRepository(base, overSSH: sshRepository)
+        } catch {
+            present(error)
+        }
+    }
+
+    private func openRepository(_ url: URL, overSSH sshRepository: SSHRepository?) async {
         guard !isBusy,
               !isSavingRepositoryFile,
               !isGeneratingCommitMessage,
@@ -662,9 +709,21 @@ final class RepositoryModel: ObservableObject {
             let historyScope = graphScope.gitScope
             let loadTask = Task.detached(priority: .userInitiated) {
                 try Task.checkCancellation()
-                let root = try GitClient.discoverRoot(from: url)
+                let root: URL
+                if let sshRepository {
+                    root = url
+                    try GitClient(
+                        repositoryURL: root,
+                        sshRepository: sshRepository
+                    ).validateSSHRepository()
+                } else {
+                    root = try GitClient.discoverRoot(from: url)
+                }
                 try Task.checkCancellation()
-                let client = GitClient(repositoryURL: root)
+                let client = GitClient(
+                    repositoryURL: root,
+                    sshRepository: sshRepository
+                )
                 RepositoryRefreshMetrics.recordFullSnapshot()
                 async let snapshot = client.snapshotAsync(
                     maxGraphCount: maxGraphCount,
@@ -709,10 +768,12 @@ final class RepositoryModel: ObservableObject {
 
             let openedRepositoryRoot = result.rootURL.standardizedFileURL.path
             repositoryURL = result.rootURL
+            self.sshRepository = sshRepository
             deferredRepositoryOpenURL = nil
             repositoryInitializationURL = nil
             if previousRepositoryRoot != openedRepositoryRoot {
                 commitMessage = ""
+                isAmendingCommit = false
                 workspaceMode = .sourceControl
                 expandedFileDirectories = []
             }
@@ -889,7 +950,7 @@ final class RepositoryModel: ObservableObject {
         activity = activityMessage
 
         do {
-            let client = GitClient(repositoryURL: repositoryURL)
+            let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
             let maxGraphCount = graphLimit
             let historyScope = graphScope.gitScope
             let loadTask = Task.detached(priority: .userInitiated) {
@@ -927,6 +988,9 @@ final class RepositoryModel: ObservableObject {
                     remotes: result.remotes,
                     activeOperation: result.activeOperation
                 )
+                if sshRepository != nil {
+                    repositoryFilesRevision &+= 1
+                }
                 activity = "Up to date"
             }
         } catch {
@@ -963,7 +1027,7 @@ final class RepositoryModel: ObservableObject {
         isRefreshInProgress = true
         pendingWorkingTreeRefresh = false
         let initialWorkingTreeVersion = workingTreeVersion
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
 
         do {
             let loadTask = Task.detached(priority: .userInitiated) {
@@ -1013,7 +1077,7 @@ final class RepositoryModel: ObservableObject {
         detailRequestID = requestID
 
         guard let repositoryURL else { return }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
 
         if change.status == "!", let activeOperation {
             detailText = "Loading conflict…"
@@ -1094,7 +1158,7 @@ final class RepositoryModel: ObservableObject {
         detailRequestID = requestID
 
         guard let repositoryURL else { return }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         Task {
             do {
                 let output = try await Task.detached(priority: .userInitiated) {
@@ -1125,7 +1189,7 @@ final class RepositoryModel: ObservableObject {
               let repositoryURL else { return }
 
         loadingCommitFileHashes.insert(commit.hash)
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         Task {
             do {
                 let files = try await Task.detached(priority: .userInitiated) {
@@ -1168,7 +1232,7 @@ final class RepositoryModel: ObservableObject {
         let requestID = UUID()
         outgoingFilesRequestID = requestID
         isLoadingOutgoingFiles = true
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         Task {
             do {
                 let files = try await Task.detached(priority: .userInitiated) {
@@ -1203,7 +1267,7 @@ final class RepositoryModel: ObservableObject {
         detailRequestID = requestID
 
         guard let repositoryURL else { return }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         Task {
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
@@ -1244,7 +1308,7 @@ final class RepositoryModel: ObservableObject {
         detailRequestID = requestID
 
         guard let repositoryURL else { return }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         Task {
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
@@ -1285,7 +1349,7 @@ final class RepositoryModel: ObservableObject {
         detailRequestID = requestID
 
         guard let repositoryURL else { return }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         Task {
             do {
                 let output = try await Task.detached(priority: .userInitiated) {
@@ -1307,7 +1371,7 @@ final class RepositoryModel: ObservableObject {
 
     func githubURL(for commit: CommitInfo) async -> URL? {
         guard let repositoryURL else { return nil }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         do {
             return try await Task.detached(priority: .userInitiated) {
                 try client.githubCommitURL(hash: commit.hash)
@@ -1321,7 +1385,7 @@ final class RepositoryModel: ObservableObject {
 
     func githubPullRequestURL(for reference: GitReference) async -> URL? {
         guard let repositoryURL else { return nil }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         do {
             return try await Task.detached(priority: .userInitiated) {
                 try client.githubPullRequestURL(for: reference)
@@ -1335,7 +1399,7 @@ final class RepositoryModel: ObservableObject {
 
     func copyCommitMessage(_ commit: CommitInfo) async -> String? {
         guard let repositoryURL else { return nil }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         do {
             let message = try await Task.detached(priority: .userInitiated) {
                 try client.commitMessage(hash: commit.hash)
@@ -1356,7 +1420,6 @@ final class RepositoryModel: ObservableObject {
         guard mode != workspaceMode else { return }
         guard !isSavingRepositoryFile else { return }
         guard mode == .sourceControl || repositoryURL != nil else { return }
-
         switch (workspaceMode, mode) {
         case (.fileEditor, .sourceControl):
             dismissRepositorySearch()
@@ -1512,6 +1575,38 @@ final class RepositoryModel: ObservableObject {
         }
     }
 
+    func repositoryFileChildren(
+        at directoryURL: URL,
+        parentRelativePath: String = ""
+    ) async throws -> [RepositoryFileTreeItem] {
+        guard let repositoryURL else { return [] }
+        guard let sshRepository else {
+            return try await RepositoryFileLoader.loadChildren(
+                of: directoryURL,
+                parentRelativePath: parentRelativePath
+            )
+        }
+        let client = GitClient(
+            repositoryURL: repositoryURL,
+            sshRepository: sshRepository
+        )
+        let entries = try await Task.detached(priority: .userInitiated) {
+            try client.sshDirectoryEntries(relativePath: parentRelativePath)
+        }.value
+        return entries.map { entry in
+            let relativePath = parentRelativePath.isEmpty
+                ? entry.name
+                : "\(parentRelativePath)/\(entry.name)"
+            return RepositoryFileTreeItem(
+                url: repositoryURL.appendingPathComponent(relativePath),
+                relativePath: relativePath,
+                name: entry.name,
+                isDirectory: entry.isDirectory,
+                isSymbolicLink: entry.isSymbolicLink
+            )
+        }
+    }
+
     var isRepositorySidePanelPresented: Bool {
         isDiffPanelPresented || isFileSearchResultsPresented
     }
@@ -1625,7 +1720,15 @@ final class RepositoryModel: ObservableObject {
 
         Task {
             do {
+                let client = GitClient(
+                    repositoryURL: repositoryURL,
+                    sshRepository: sshRepository
+                )
                 let result = try await Task.detached(priority: .userInitiated) {
+                    try client.downloadSSHFile(
+                        relativePath: relativePath,
+                        to: fileURL
+                    )
                     let document = try RepositoryFileLoader.document(at: fileURL)
                     return (
                         document,
@@ -1714,17 +1817,38 @@ final class RepositoryModel: ObservableObject {
             isFileSearchResultsPresented = true
         }
         let revision = repositoryFilesRevision
+        let editedPath = selectedRepositoryFilePath
+        let editedText = repositoryFileText
         repositorySearchTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: .milliseconds(160))
-                let client = GitClient(repositoryURL: repositoryURL)
+                let client = GitClient(
+                    repositoryURL: repositoryURL,
+                    sshRepository: self?.sshRepository
+                )
                 let searchTask = Task.detached(priority: .userInitiated) {
                     try client.searchRepository(for: query)
                 }
-                let results = try await withTaskCancellationHandler {
+                var results = try await withTaskCancellationHandler {
                     try await searchTask.value
                 } onCancel: {
                     searchTask.cancel()
+                }
+                if let editedPath {
+                    let editedMatches = RepositorySearchParser.textMatches(
+                        in: editedText,
+                        path: editedPath,
+                        query: query,
+                        limit: 20
+                    )
+                    results = RepositorySearchResults(
+                        fileMatches: results.fileMatches,
+                        textMatches: results.textMatches.filter {
+                            $0.path != editedPath
+                        } + editedMatches,
+                        fileMatchesWereLimited: results.fileMatchesWereLimited,
+                        textMatchesWereLimited: results.textMatchesWereLimited
+                    )
                 }
                 guard !Task.isCancelled,
                       let self,
@@ -1933,6 +2057,18 @@ final class RepositoryModel: ObservableObject {
                 try handle.truncate(atOffset: 0)
                 try handle.write(contentsOf: data)
                 try handle.synchronize()
+            }.value
+            guard let repositoryURL else { return }
+            let sshRepository = sshRepository
+            let relativePath = selectedRepositoryFilePath ?? fileURL.lastPathComponent
+            try await Task.detached(priority: .userInitiated) {
+                try GitClient(
+                    repositoryURL: repositoryURL,
+                    sshRepository: sshRepository
+                ).uploadSSHFile(
+                    fileURL,
+                    relativePath: relativePath
+                )
             }.value
             guard detailRequestID == fileRequestID,
                   selectedRepositoryFileURL == fileURL else { return }
@@ -2424,7 +2560,20 @@ final class RepositoryModel: ObservableObject {
               !hasPendingChangeOperations else { return }
         let message = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else {
-            errorMessage = "Please enter a commit message."
+            guard let repositoryURL, let headHash else { return }
+            let client = GitClient(
+                repositoryURL: repositoryURL,
+                sshRepository: sshRepository
+            )
+            do {
+                commitMessage = try await Task.detached(priority: .userInitiated) {
+                    try client.commitMessage(hash: headHash)
+                }.value
+                isAmendingCommit = true
+                activity = "Edit the previous message, then choose Amend Last Commit again"
+            } catch {
+                present(error)
+            }
             return
         }
 
@@ -2433,6 +2582,7 @@ final class RepositoryModel: ObservableObject {
         }
         if succeeded {
             commitMessage = ""
+            isAmendingCommit = false
         }
     }
 
@@ -2451,6 +2601,7 @@ final class RepositoryModel: ObservableObject {
         }
         if succeeded {
             commitMessage = ""
+            isAmendingCommit = false
         }
     }
 
@@ -2475,7 +2626,7 @@ final class RepositoryModel: ObservableObject {
               !isBusy,
               !isGeneratingCommitMessage else { return false }
         let branch = branch
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         let hasOrigin = await Task.detached(priority: .userInitiated) {
             client.originRemoteURL() != nil
         }.value
@@ -2521,6 +2672,10 @@ final class RepositoryModel: ObservableObject {
     }
 
     func performPrimaryAction() async {
+        if isAmendingCommit {
+            await amend()
+            return
+        }
         switch primaryAction {
         case .commit:
             await commit()
@@ -2545,7 +2700,7 @@ final class RepositoryModel: ObservableObject {
         activity = "Loading more history…"
 
         do {
-            let client = GitClient(repositoryURL: repositoryURL)
+            let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
             let remoteReferenceID = upstreamReference?.id
             let offset = graphHistoryOffset
             let layoutState = graphLayoutState
@@ -2666,6 +2821,7 @@ final class RepositoryModel: ObservableObject {
         if clearMessage {
             commitMessage = ""
         }
+        isAmendingCommit = false
 
         if pushAfterCommit {
             if hasUpstream {
@@ -2919,7 +3075,7 @@ final class RepositoryModel: ObservableObject {
         snapshotRequestID = UUID()
         workingTreeVersion += 1
         activity = message
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
 
         do {
             try await mutationQueue.run(client: client) {
@@ -3016,7 +3172,7 @@ final class RepositoryModel: ObservableObject {
               !isGeneratingCommitMessage else { return false }
         isBusy = true
         activity = "Deleting \(reference.name)…"
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         do {
             try await mutationQueue.run(client: client) {
                 try $0.deleteLocalBranch(name: reference.name, force: false)
@@ -3122,7 +3278,7 @@ final class RepositoryModel: ObservableObject {
               !isSavingRepositoryFile,
               !isGeneratingCommitMessage else { return }
         do {
-            let client = GitClient(repositoryURL: repositoryURL)
+            let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
             let loadedRemotes = try await Task.detached(priority: .userInitiated) {
                 try client.remotes()
             }.value
@@ -3309,7 +3465,7 @@ final class RepositoryModel: ObservableObject {
         detailRequestID = requestID
 
         guard let repositoryURL else { return }
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         Task {
             do {
                 let output = try await Task.detached(priority: .userInitiated) {
@@ -3355,7 +3511,7 @@ final class RepositoryModel: ObservableObject {
         let requestID = UUID()
         snapshotRequestID = requestID
         activity = "Switching graph scope…"
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
         let remoteReferenceID = upstreamReference?.id
         let pageSize = graphPageSize
         guard let knownHeadHash = headHash else { return }
@@ -3404,6 +3560,7 @@ final class RepositoryModel: ObservableObject {
         let configuration = AICommitMessageConfiguration.load()
         guard confirmAIProcessingConsentIfNeeded(for: configuration.provider) else { return }
         let messageBeforeGeneration = commitMessage
+        let sshRepository = self.sshRepository
         isGeneratingCommitMessage = true
         let hasInstructions = !messageBeforeGeneration
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3416,6 +3573,7 @@ final class RepositoryModel: ObservableObject {
             let message = try await Task.detached(priority: .userInitiated) {
                 try AICommitMessageGenerator(configuration: configuration).generate(
                     in: repositoryURL,
+                    overSSH: sshRepository,
                     userInstructions: messageBeforeGeneration
                 )
             }.value
@@ -3472,7 +3630,7 @@ final class RepositoryModel: ObservableObject {
 
         pendingChangePaths.formUnion(paths)
         activity = message
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
 
         do {
             try await mutationQueue.run(client: client, operation: operation)
@@ -3509,7 +3667,7 @@ final class RepositoryModel: ObservableObject {
         snapshotRequestID = UUID()
         workingTreeVersion += 1
         activity = message
-        let client = GitClient(repositoryURL: repositoryURL)
+        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
 
         do {
             try await mutationQueue.run(client: client, operation: operation)

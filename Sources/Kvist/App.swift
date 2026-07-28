@@ -241,15 +241,22 @@ struct KvistApp: App {
                 Divider()
 
                 Button("Commit") {
-                    Task { await tabsModel.activeModel.commit() }
+                    Task {
+                        if tabsModel.activeModel.isAmendingCommit {
+                            await tabsModel.activeModel.amend()
+                        } else {
+                            await tabsModel.activeModel.commit()
+                        }
+                    }
                 }
                 .keyboardShortcut(.return, modifiers: [.command])
                 .disabled(
-                    !tabsModel.activeModel.hasChanges
-                    || tabsModel.activeModel.isBusy
-                    || tabsModel.activeModel.isSavingRepositoryFile
-                    || tabsModel.activeModel.hasPendingChangeOperations
-                    || tabsModel.activeModel.isGeneratingCommitMessage
+                    (!tabsModel.activeModel.isAmendingCommit
+                        && !tabsModel.activeModel.hasChanges)
+                        || tabsModel.activeModel.isBusy
+                        || tabsModel.activeModel.isSavingRepositoryFile
+                        || tabsModel.activeModel.hasPendingChangeOperations
+                        || tabsModel.activeModel.isGeneratingCommitMessage
                 )
                 }
             }

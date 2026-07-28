@@ -29,10 +29,11 @@ struct AICommitMessageGenerator: Sendable {
 
     func generate(
         in repositoryURL: URL,
+        overSSH sshRepository: SSHRepository? = nil,
         userInstructions: String? = nil
     ) throws -> String {
-        try requireStagedChanges(in: repositoryURL)
-        let stagedDiff = try readStagedDiff(in: repositoryURL)
+        try requireStagedChanges(in: repositoryURL, overSSH: sshRepository)
+        let stagedDiff = try readStagedDiff(in: repositoryURL, overSSH: sshRepository)
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("Kvist-AI-Commit-\(UUID().uuidString)", isDirectory: true)
         let schemaURL = temporaryDirectory.appendingPathComponent("commit-message.schema.json")
@@ -71,7 +72,9 @@ struct AICommitMessageGenerator: Sendable {
         }
 
         let executable: URL?
-        if configuration.commandTemplate.contains("{executable}") {
+        if sshRepository != nil {
+            executable = nil
+        } else if configuration.commandTemplate.contains("{executable}") {
             executable = try AICommitMessageExecutableResolver.resolve(
                 provider: configuration.provider,
                 candidateURLs: explicitCandidates
@@ -83,19 +86,60 @@ struct AICommitMessageGenerator: Sendable {
         let command = try Self.expandCommandTemplate(
             configuration.commandTemplate,
             executableURL: executable,
+            executableName: sshRepository == nil ? nil : configuration.provider.executableName,
             model: configuration.model,
             reasoningEffort: configuration.reasoningEffort,
-            repositoryURL: repositoryURL,
+            repositoryURL: sshRepository.map {
+                URL(fileURLWithPath: $0.path, isDirectory: true)
+            } ?? repositoryURL,
             schemaURL: schemaURL,
             outputURL: outputURL
         )
-        let result = try AICommandRunner.run(
-            executable: URL(fileURLWithPath: "/bin/zsh"),
-            arguments: ["-lc", command],
-            currentDirectoryURL: repositoryURL,
-            standardInput: prompt,
-            timeout: 120
-        )
+        let result: ProcessResult
+        if let sshRepository {
+            let remoteDirectory = "/tmp/kvist-ai-commit-\(UUID().uuidString)"
+            let remoteSchema = "\(remoteDirectory)/commit-message.schema.json"
+            let remoteOutput = "\(remoteDirectory)/commit-message.json"
+            let remoteLog = "\(remoteDirectory)/command.log"
+            let remoteCommand = try Self.expandCommandTemplate(
+                configuration.commandTemplate,
+                executableURL: executable,
+                executableName: configuration.provider.executableName,
+                model: configuration.model,
+                reasoningEffort: configuration.reasoningEffort,
+                repositoryURL: URL(fileURLWithPath: sshRepository.path, isDirectory: true),
+                schemaURL: URL(fileURLWithPath: remoteSchema),
+                outputURL: URL(fileURLWithPath: remoteOutput)
+            )
+            let script = """
+            mkdir -p \(Self.shellQuote(remoteDirectory)) &&
+            printf %s \(Self.shellQuote(Self.schema)) > \(Self.shellQuote(remoteSchema)) &&
+            \(remoteCommand) > \(Self.shellQuote(remoteLog)) 2>&1
+            status=$?
+            if [ "$status" -eq 0 ] && [ -s \(Self.shellQuote(remoteOutput)) ]; then
+              cat \(Self.shellQuote(remoteOutput))
+            else
+              cat \(Self.shellQuote(remoteLog))
+            fi
+            rm -rf \(Self.shellQuote(remoteDirectory))
+            exit "$status"
+            """
+            result = try AICommandRunner.run(
+                executable: URL(fileURLWithPath: "/usr/bin/ssh"),
+                arguments: Self.sshArguments(for: sshRepository, command: script),
+                currentDirectoryURL: nil,
+                standardInput: prompt,
+                timeout: 120
+            )
+        } else {
+            result = try AICommandRunner.run(
+                executable: URL(fileURLWithPath: "/bin/zsh"),
+                arguments: ["-lc", command],
+                currentDirectoryURL: repositoryURL,
+                standardInput: prompt,
+                timeout: 120
+            )
+        }
 
         guard result.exitCode == 0 else {
             throw classifyExecutionFailure(result.output)
@@ -127,6 +171,7 @@ struct AICommitMessageGenerator: Sendable {
     static func expandCommandTemplate(
         _ template: String,
         executableURL: URL?,
+        executableName: String? = nil,
         model: String,
         reasoningEffort: AICommitMessageReasoningEffort? = nil,
         repositoryURL: URL,
@@ -158,19 +203,29 @@ struct AICommitMessageGenerator: Sendable {
         }
 
         if command.contains("{executable}") {
-            guard let executableURL else {
+            guard let executable = executableName ?? executableURL?.path else {
                 throw AICommitMessageError.emptyCommand
             }
             command = command.replacingOccurrences(
                 of: "{executable}",
-                with: shellQuote(executableURL.path)
+                with: shellQuote(executable)
             )
         }
         return command
     }
 
-    private static func shellQuote(_ value: String) -> String {
+    static func shellQuote(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
+    }
+
+    static func sshArguments(for repository: SSHRepository, command: String) -> [String] {
+        [
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            repository.host,
+            "--",
+            "cd \(shellQuote(repository.path)) && \(command)"
+        ]
     }
 
     private static func decodeMessage(
@@ -226,7 +281,27 @@ struct AICommitMessageGenerator: Sendable {
         return candidates
     }
 
-    private func requireStagedChanges(in repositoryURL: URL) throws {
+    private func requireStagedChanges(
+        in repositoryURL: URL,
+        overSSH sshRepository: SSHRepository?
+    ) throws {
+        if let sshRepository {
+            let result = try AICommandRunner.run(
+                executable: URL(fileURLWithPath: "/usr/bin/ssh"),
+                arguments: Self.sshArguments(
+                    for: sshRepository,
+                    command: "GIT_OPTIONAL_LOCKS=0 git diff --cached --quiet --exit-code"
+                ),
+                currentDirectoryURL: nil,
+                standardInput: nil,
+                timeout: 15
+            )
+            switch result.exitCode {
+            case 0: throw AICommitMessageError.noStagedChanges
+            case 1: return
+            default: throw AICommitMessageError.invalidRepository(configuration.provider)
+            }
+        }
         let result = try AICommandRunner.run(
             executable: URL(fileURLWithPath: "/usr/bin/env"),
             arguments: [
@@ -252,7 +327,26 @@ struct AICommitMessageGenerator: Sendable {
         }
     }
 
-    private func readStagedDiff(in repositoryURL: URL) throws -> String {
+    private func readStagedDiff(
+        in repositoryURL: URL,
+        overSSH sshRepository: SSHRepository?
+    ) throws -> String {
+        if let sshRepository {
+            let result = try AICommandRunner.run(
+                executable: URL(fileURLWithPath: "/usr/bin/ssh"),
+                arguments: Self.sshArguments(
+                    for: sshRepository,
+                    command: "GIT_OPTIONAL_LOCKS=0 git diff --cached --no-ext-diff --no-color"
+                ),
+                currentDirectoryURL: nil,
+                standardInput: nil,
+                timeout: 30
+            )
+            guard result.exitCode == 0 else {
+                throw AICommitMessageError.invalidRepository(configuration.provider)
+            }
+            return result.output
+        }
         let result = try AICommandRunner.run(
             executable: URL(fileURLWithPath: "/usr/bin/env"),
             arguments: [
