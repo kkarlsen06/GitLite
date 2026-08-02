@@ -35,6 +35,126 @@ final class GitClientTests: XCTestCase {
         )
     }
 
+    func testSSHConnectionUsesPrivatePersistentControlSocket() {
+        let directory = URL(
+            fileURLWithPath: "/Users/kvist test/Library/Caches/Kvist/SSH",
+            isDirectory: true
+        )
+
+        XCTAssertEqual(
+            SSHConnection.options(controlDirectory: directory),
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "ControlMaster=auto",
+                "-o", "ControlPersist=120",
+                "-o", "ControlPath=/Users/kvist test/Library/Caches/Kvist/SSH/%C"
+            ]
+        )
+        XCTAssertEqual(
+            SSHConnection.options(controlDirectory: nil),
+            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+        )
+    }
+
+    func testSSHRemoteShellQuotesControlPathForRsync() {
+        let directory = URL(fileURLWithPath: "/tmp/Kvist SSH", isDirectory: true)
+        let command = SSHConnection.rsyncRemoteShell(controlDirectory: directory)
+
+        XCTAssertTrue(command.hasPrefix("'/usr/bin/ssh' "))
+        XCTAssertTrue(command.contains("'ControlMaster=auto'"))
+        XCTAssertTrue(command.contains("'ControlPath=/tmp/Kvist SSH/%C'"))
+    }
+
+    func testRemoteCommandFramingPreservesBinaryOutputAndExitCodes() throws {
+        var data = Data("0 4\n".utf8)
+        data.append(contentsOf: [0x41, 0x00, 0x42, 0x0A])
+        data.append(Data("7 3\nerr".utf8))
+
+        let results = try GitClient.parseRemoteCommandResults(data, expectedCount: 2)
+
+        XCTAssertEqual(results.map(\.exitCode), [0, 7])
+        XCTAssertEqual(results[0].output, Data([0x41, 0x00, 0x42, 0x0A]))
+        XCTAssertEqual(String(decoding: results[1].output, as: UTF8.self), "err")
+    }
+
+    func testRemoteCommandBatchRunsAllCommandsAfterAFailure() throws {
+        let script = GitClient.framedRemoteCommands([
+            "printf 'first\\0result'",
+            "printf 'failed'; exit 9",
+            "printf 'last'"
+        ])
+        let result = try AICommandRunner.run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", script],
+            currentDirectoryURL: nil,
+            standardInput: nil,
+            timeout: 10
+        )
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        let commands = try GitClient.parseRemoteCommandResults(
+            Data(result.output.utf8),
+            expectedCount: 3
+        )
+        XCTAssertEqual(commands.map(\.exitCode), [0, 9, 0])
+        XCTAssertEqual(commands.map { String(decoding: $0.output, as: UTF8.self) }, [
+            "first\0result", "failed", "last"
+        ])
+    }
+
+    func testRemoteOperationCommandChecksGitStateOnRemoteFilesystem() throws {
+        let gitDirectory = repositoryURL.appendingPathComponent(".git", isDirectory: true)
+        let mergeHead = gitDirectory.appendingPathComponent("MERGE_HEAD")
+        try Data().write(to: mergeHead)
+
+        var result = try AICommandRunner.run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", GitClient.remoteOperationCommand(path: repositoryURL.path)],
+            currentDirectoryURL: nil,
+            standardInput: nil,
+            timeout: 10
+        )
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        XCTAssertEqual(result.output.trimmingCharacters(in: .whitespacesAndNewlines), "merge")
+
+        try FileManager.default.createDirectory(
+            at: gitDirectory.appendingPathComponent("rebase-merge", isDirectory: true),
+            withIntermediateDirectories: false
+        )
+        result = try AICommandRunner.run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", GitClient.remoteOperationCommand(path: repositoryURL.path)],
+            currentDirectoryURL: nil,
+            standardInput: nil,
+            timeout: 10
+        )
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        XCTAssertEqual(result.output.trimmingCharacters(in: .whitespacesAndNewlines), "rebase")
+    }
+
+    func testRemoteListingParserReadsFetchAndPushURLsInOneResponse() throws {
+        let output = """
+        upstream\tssh://git@example.com/second.git (push)
+        origin\t/Repos/project with spaces (fetch)
+        upstream\tssh://git@example.com/second.git (fetch)
+        origin\tssh://git@example.com/project.git (push)
+        """
+
+        XCTAssertEqual(try GitClient.parseRemotes(output), [
+            GitRemote(
+                name: "origin",
+                fetchURL: "/Repos/project with spaces",
+                pushURL: "ssh://git@example.com/project.git"
+            ),
+            GitRemote(
+                name: "upstream",
+                fetchURL: "ssh://git@example.com/second.git",
+                pushURL: "ssh://git@example.com/second.git"
+            )
+        ])
+    }
+
     func testSSHDirectoryEntriesPreserveNamesAndHideGitMetadata() throws {
         let data = try XCTUnwrap(
             "d\u{0}Sources\u{0}f\u{0}line\nbreak.txt\u{0}l\u{0}link\u{0}d\u{0}.git\u{0}"

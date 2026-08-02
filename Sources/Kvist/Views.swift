@@ -191,7 +191,7 @@ struct BranchGlyph: View {
 }
 
 struct SSHLogo: View {
-    private static let image = Bundle.module.url(
+    private static let image = Bundle.kvistResources.url(
         forResource: "Unofficial_SSH_Logo",
         withExtension: "svg"
     ).flatMap(NSImage.init(contentsOf:))
@@ -2197,28 +2197,21 @@ struct RepositoryTerminalButton: View {
 
     private func openRepositoryInTerminal() {
         guard let repositoryURL = model.repositoryURL else { return }
-
-        let workspace = NSWorkspace.shared
-        guard let terminalURL = workspace.urlForApplication(
-            withBundleIdentifier: "com.apple.Terminal"
-        ) else {
-            model.errorMessage = "Terminal could not be found."
-            return
+        do {
+            try RepositoryTerminalLauncher.open(
+                repositoryURL: repositoryURL,
+                sshRepository: model.sshRepository
+            )
+        } catch {
+            model.errorMessage = error.localizedDescription
         }
-
-        workspace.open(
-            [repositoryURL],
-            withApplicationAt: terminalURL,
-            configuration: NSWorkspace.OpenConfiguration(),
-            completionHandler: nil
-        )
     }
 }
 
 @MainActor
 enum RepositoryLocationSymbol {
     static let image: NSImage? = {
-        guard let image = Bundle.module.image(
+        guard let image = Bundle.kvistResources.image(
             forResource: NSImage.Name("custom.folder.badge.eye")
         ) else { return nil }
         image.isTemplate = true
@@ -3327,29 +3320,29 @@ struct SpinningCodiconGlyph: View {
     let isSpinning: Bool
     var size: CGFloat = 16
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if isSpinning && !reduceMotion {
+            RotatingCodiconGlyph(icon: icon, size: size)
+        } else {
+            CodiconGlyph(icon: icon, size: size)
+        }
+    }
+}
+
+private struct RotatingCodiconGlyph: View {
+    let icon: Codicon
+    let size: CGFloat
     @State private var rotating = false
 
     var body: some View {
         CodiconGlyph(icon: icon, size: size)
             .rotationEffect(.degrees(rotating ? 360 : 0))
-            .onAppear { updateRotation(isSpinning) }
-            .onChange(of: isSpinning) { _, spinning in
-                updateRotation(spinning)
+            .onAppear {
+                withAnimation(.linear(duration: 1).repeatForever(autoreverses: false)) {
+                    rotating = true
+                }
             }
-    }
-
-    private func updateRotation(_ spinning: Bool) {
-        if spinning && !reduceMotion {
-            withAnimation(.linear(duration: 1).repeatForever(autoreverses: false)) {
-                rotating = true
-            }
-        } else {
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                rotating = false
-            }
-        }
     }
 }
 
@@ -3416,25 +3409,23 @@ private struct CommitMessageInput: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            ZStack(alignment: .topLeading) {
+            ZStack(alignment: .leading) {
                 if messageState.text.isEmpty {
                     Text("Message (⌘Enter to commit on \"\(model.branch)\")")
                         .font(AppType.row)
                         .foregroundStyle(AppTheme.muted)
                         .lineLimit(1)
-                        .padding(.leading, 5)
-                        .padding(.top, 5)
                         .allowsHitTesting(false)
                 }
 
-                TextEditor(text: $messageState.text)
+                TextField("", text: $messageState.text, axis: .vertical)
+                    .textFieldStyle(.plain)
                     .font(AppType.row)
                     .foregroundStyle(AppTheme.primary)
-                    .scrollContentBackground(.hidden)
-                    .autocorrectionDisabled()
                     .accessibilityLabel("Commit message")
                     .focused($focused)
-                    .frame(height: 54)
+                    .lineLimit(1...10)
+                    .fixedSize(horizontal: false, vertical: true)
                     .disabled(
                         model.isBusy
                             || model.isSavingRepositoryFile
@@ -3746,6 +3737,7 @@ private struct FileSection: View {
             .padding(.leading, 22)
             .padding(.trailing, 21)
             .frame(height: 33)
+            .contentShape(Rectangle())
             .foregroundStyle(AppTheme.primary)
             .background(hovering ? AppTheme.hover : .clear)
             .onHover { hovering = $0 }

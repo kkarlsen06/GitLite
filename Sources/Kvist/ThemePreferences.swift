@@ -439,11 +439,11 @@ final class ThemePreferences: ObservableObject {
         )
     ]
 
-    private static let materialIconPackManifestURL = Bundle.module.url(
+    private static let materialIconPackManifestURL = Bundle.kvistResources.url(
         forResource: "manifest",
         withExtension: "json",
         subdirectory: "MaterialIconTheme"
-    ) ?? Bundle.module.url(
+    ) ?? Bundle.kvistResources.url(
         forResource: "manifest",
         withExtension: "json"
     )

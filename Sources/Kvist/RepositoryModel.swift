@@ -730,17 +730,15 @@ final class RepositoryModel: ObservableObject {
                 async let remotes = Task.detached(priority: .userInitiated) {
                     try client.remotes()
                 }.value
-                async let activeOperation = Task.detached(priority: .userInitiated) {
-                    client.operationInProgress()
-                }.value
                 async let watchPaths = Task.detached(priority: .userInitiated) {
                     try client.repositoryWatchPaths()
                 }.value
+                let loadedSnapshot = try await snapshot
                 return RepositoryOpenResult(
                     rootURL: root,
-                    snapshot: try await snapshot,
+                    snapshot: loadedSnapshot,
                     remotes: try await remotes,
-                    activeOperation: await activeOperation,
+                    activeOperation: loadedSnapshot.activeOperation,
                     watchPaths: try await watchPaths
                 )
             }
@@ -960,13 +958,11 @@ final class RepositoryModel: ObservableObject {
                 async let remotes = Task.detached(priority: .userInitiated) {
                     try client.remotes()
                 }.value
-                async let activeOperation = Task.detached(priority: .userInitiated) {
-                    client.operationInProgress()
-                }.value
+                let loadedSnapshot = try await snapshot
                 return RepositoryRefreshResult(
-                    snapshot: try await snapshot,
+                    snapshot: loadedSnapshot,
                     remotes: try await remotes,
-                    activeOperation: await activeOperation
+                    activeOperation: loadedSnapshot.activeOperation
                 )
             }
             repositorySnapshotLoadTask = loadTask

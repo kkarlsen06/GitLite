@@ -10,6 +10,11 @@ struct KvistApp: App {
     @State private var hasPresentedInitialFrame = false
 
     init() {
+        // Writing to a child process whose stdin has closed — an `ssh` that failed
+        // to connect, a helper that exited early — otherwise kills the app outright
+        // with SIGPIPE, before any Swift error can be thrown. Ignoring it turns
+        // those writes into an EPIPE the caller can handle.
+        signal(SIGPIPE, SIG_IGN)
         let benchmark = KvistPerformanceInstrumentation.configuration
         if benchmark != nil {
             KvistRuntimeMetrics.reset()

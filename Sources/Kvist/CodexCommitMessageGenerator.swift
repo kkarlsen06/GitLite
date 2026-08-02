@@ -111,22 +111,21 @@ struct AICommitMessageGenerator: Sendable {
                 schemaURL: URL(fileURLWithPath: remoteSchema),
                 outputURL: URL(fileURLWithPath: remoteOutput)
             )
-            let script = """
-            mkdir -p \(Self.shellQuote(remoteDirectory)) &&
-            printf %s \(Self.shellQuote(Self.schema)) > \(Self.shellQuote(remoteSchema)) &&
-            \(remoteCommand) > \(Self.shellQuote(remoteLog)) 2>&1
-            status=$?
-            if [ "$status" -eq 0 ] && [ -s \(Self.shellQuote(remoteOutput)) ]; then
-              cat \(Self.shellQuote(remoteOutput))
-            else
-              cat \(Self.shellQuote(remoteLog))
-            fi
-            rm -rf \(Self.shellQuote(remoteDirectory))
-            exit "$status"
-            """
+            let script = Self.remoteScript(
+                executableName: configuration.provider.executableName,
+                command: remoteCommand,
+                directory: remoteDirectory,
+                schemaPath: remoteSchema,
+                outputPath: remoteOutput,
+                logPath: remoteLog
+            )
             result = try AICommandRunner.run(
-                executable: URL(fileURLWithPath: "/usr/bin/ssh"),
-                arguments: Self.sshArguments(for: sshRepository, command: script),
+                executable: SSHConnection.executableURL,
+                arguments: Self.sshArguments(
+                    for: sshRepository,
+                    command: script,
+                    inLoginShell: true
+                ),
                 currentDirectoryURL: nil,
                 standardInput: prompt,
                 timeout: 120
@@ -142,7 +141,11 @@ struct AICommitMessageGenerator: Sendable {
         }
 
         guard result.exitCode == 0 else {
-            throw classifyExecutionFailure(result.output)
+            throw classifyExecutionFailure(
+                result.output,
+                exitCode: result.exitCode,
+                host: sshRepository?.host
+            )
         }
 
         let data: Data
@@ -214,19 +217,78 @@ struct AICommitMessageGenerator: Sendable {
         return command
     }
 
+    static func remoteScript(
+        executableName: String,
+        command: String,
+        directory: String,
+        schemaPath: String,
+        outputPath: String,
+        logPath: String
+    ) -> String {
+        """
+        \(remotePathPreamble)
+        if ! command -v \(shellQuote(executableName)) > /dev/null 2>&1; then
+          echo \(shellQuote("\(executableName): command not found")) >&2
+          echo "Remote PATH: $PATH" >&2
+          exit 127
+        fi
+        mkdir -p \(shellQuote(directory)) &&
+        printf %s \(shellQuote(schema)) > \(shellQuote(schemaPath)) &&
+        \(command) > \(shellQuote(logPath)) 2>&1
+        status=$?
+        if [ "$status" -eq 0 ] && [ -s \(shellQuote(outputPath)) ]; then
+          cat \(shellQuote(outputPath))
+        else
+          cat \(shellQuote(logPath))
+        fi
+        rm -rf \(shellQuote(directory))
+        exit "$status"
+        """
+    }
+
     static func shellQuote(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
     }
 
-    static func sshArguments(for repository: SSHRepository, command: String) -> [String] {
-        [
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            repository.host,
-            "--",
-            "cd \(shellQuote(repository.path)) && \(command)"
-        ]
+    /// `ssh -- host command` runs the command in a non-interactive shell, which
+    /// reads neither `.bashrc` nor `.zshrc`, so CLIs installed under `$HOME`
+    /// are missing from `PATH`. Re-exec the command in a login shell — that
+    /// picks up `.profile`, `.bash_profile`, and `.zprofile` — and add the
+    /// directories the Claude and Codex installers use on top of it. `$SHELL`
+    /// is used only when it is POSIX-compatible; the script below is `sh`
+    /// syntax, which fish and tcsh cannot parse.
+    static func sshArguments(
+        for repository: SSHRepository,
+        command: String,
+        inLoginShell: Bool = false
+    ) -> [String] {
+        let remoteCommand = inLoginShell
+            ? """
+            kvist_shell="${SHELL:-/bin/sh}"; case "${kvist_shell##*/}" in bash|zsh|sh|ksh|dash|ash) ;; *) kvist_shell=/bin/sh ;; esac; exec "$kvist_shell" -l -c \(shellQuote(command))
+            """
+            : command
+        return SSHConnection.arguments(
+            host: repository.host,
+            command: "cd \(shellQuote(repository.path)) && \(remoteCommand)"
+        )
     }
+
+    static let remotePathPreamble = """
+    kvist_add_path() {
+      [ -d "$1" ] || return 0
+      case ":$PATH:" in
+        *":$1:"*) ;;
+        *) PATH="$PATH:$1" ;;
+      esac
+    }
+    for kvist_dir in "$HOME/.local/bin" "$HOME/bin" "$HOME/.claude/local" "$HOME/.codex/bin" "$HOME/.npm-global/bin" "$HOME/.yarn/bin" "$HOME/.bun/bin" "$HOME/.deno/bin" "$HOME/.volta/bin" "$HOME/.asdf/shims" "$HOME/.local/share/mise/shims" "$HOME/.cargo/bin" /opt/homebrew/bin /usr/local/bin /snap/bin; do
+      kvist_add_path "$kvist_dir"
+    done
+    for kvist_dir in "$HOME"/.nvm/versions/node/*/bin "$HOME"/.local/share/fnm/node-versions/*/installation/bin "$HOME"/.fnm/node-versions/*/installation/bin; do
+      kvist_add_path "$kvist_dir"
+    done
+    export PATH
+    """
 
     private static func decodeMessage(
         from data: Data,
@@ -287,7 +349,7 @@ struct AICommitMessageGenerator: Sendable {
     ) throws {
         if let sshRepository {
             let result = try AICommandRunner.run(
-                executable: URL(fileURLWithPath: "/usr/bin/ssh"),
+                executable: SSHConnection.executableURL,
                 arguments: Self.sshArguments(
                     for: sshRepository,
                     command: "GIT_OPTIONAL_LOCKS=0 git diff --cached --quiet --exit-code"
@@ -333,7 +395,7 @@ struct AICommitMessageGenerator: Sendable {
     ) throws -> String {
         if let sshRepository {
             let result = try AICommandRunner.run(
-                executable: URL(fileURLWithPath: "/usr/bin/ssh"),
+                executable: SSHConnection.executableURL,
                 arguments: Self.sshArguments(
                     for: sshRepository,
                     command: "GIT_OPTIONAL_LOCKS=0 git diff --cached --no-ext-diff --no-color"
@@ -375,8 +437,18 @@ struct AICommitMessageGenerator: Sendable {
         )
     }
 
-    private func classifyExecutionFailure(_ output: String) -> AICommitMessageError {
+    private func classifyExecutionFailure(
+        _ output: String,
+        exitCode: Int32,
+        host: String?
+    ) -> AICommitMessageError {
         let lowercased = output.lowercased()
+        if exitCode == 127 || lowercased.contains("command not found") {
+            if let host {
+                return .notInstalledRemotely(configuration.provider, host, output)
+            }
+            return .notInstalled(configuration.provider)
+        }
         if lowercased.contains("not logged in")
             || lowercased.contains("authentication")
             || lowercased.contains("unauthorized")
@@ -560,7 +632,14 @@ private enum AICommitMessageExecutableResolver {
     }
 }
 
-private enum AICommandRunner {
+enum AICommandRunner {
+    /// The app ignores SIGPIPE at launch, but this runner also writes to child
+    /// stdin from tests and benchmarks, where that never runs. Without it a child
+    /// that exits early kills the whole process on the write below.
+    private static let ignoresBrokenPipeSignal: Void = {
+        signal(SIGPIPE, SIG_IGN)
+    }()
+
     static func run(
         executable: URL,
         arguments: [String],
@@ -568,11 +647,13 @@ private enum AICommandRunner {
         standardInput: String?,
         timeout: TimeInterval
     ) throws -> ProcessResult {
+        ignoresBrokenPipeSignal
         let process = Process()
         let outputPipe = Pipe()
         let inputPipe = Pipe()
         let outputBox = ProcessOutputBox()
         let readerGroup = DispatchGroup()
+        let writerGroup = DispatchGroup()
 
         process.executableURL = executable
         process.arguments = arguments
@@ -601,8 +682,20 @@ private enum AICommandRunner {
         }
 
         if let standardInput {
-            inputPipe.fileHandleForWriting.write(Data(standardInput.utf8))
-            try? inputPipe.fileHandleForWriting.close()
+            let handle = inputPipe.fileHandleForWriting
+            let payload = Data(standardInput.utf8)
+            writerGroup.enter()
+            DispatchQueue.global(qos: .utility).async {
+                defer { writerGroup.leave() }
+                // A child that already exited — `ssh` that could not connect, a
+                // provider command that failed immediately — makes this fail with
+                // EPIPE. Its exit status and captured output describe the real
+                // failure, so drop the write and let the caller report that. The
+                // write also runs off this thread so a child that never drains its
+                // stdin cannot block the timeout below.
+                try? handle.write(contentsOf: payload)
+                try? handle.close()
+            }
         }
 
         let deadline = Date().addingTimeInterval(timeout)
@@ -620,11 +713,13 @@ private enum AICommandRunner {
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
             try? outputPipe.fileHandleForReading.close()
             _ = readerGroup.wait(timeout: .now() + 2)
+            _ = writerGroup.wait(timeout: .now() + 2)
             throw AICommitMessageError.timedOut
         }
 
         process.waitUntilExit()
         readerGroup.wait()
+        _ = writerGroup.wait(timeout: .now() + 2)
         return ProcessResult(
             exitCode: process.terminationStatus,
             output: String(data: outputBox.data, encoding: .utf8) ?? ""
@@ -672,7 +767,7 @@ private struct CodexReasoningLevel: Decodable {
     let effort: String
 }
 
-private struct ProcessResult {
+struct ProcessResult {
     let exitCode: Int32
     let output: String
 }
@@ -697,6 +792,7 @@ private final class ProcessOutputBox: @unchecked Sendable {
 enum AICommitMessageError: LocalizedError {
     case noStagedChanges
     case notInstalled(AICommitMessageProvider)
+    case notInstalledRemotely(AICommitMessageProvider, String, String?)
     case brokenInstallation(AICommitMessageProvider)
     case notAuthenticated(AICommitMessageProvider)
     case networkUnavailable(AICommitMessageProvider)
@@ -715,6 +811,8 @@ enum AICommitMessageError: LocalizedError {
             return "Stage changes before generating a commit message. The AI only summarizes the staged diff."
         case .notInstalled(let provider):
             return "\(provider.displayName) CLI was not found. Install it, sign in, and try again."
+        case .notInstalledRemotely(let provider, let host, _):
+            return "\(provider.displayName) CLI was not found on \(host). Install it there, or add it to the PATH your login shell sets, and try again."
         case .brokenInstallation(let provider):
             return "\(provider.displayName) CLI is installed but could not run. Reinstall or update it, then try again."
         case .notAuthenticated(let provider):
@@ -749,6 +847,8 @@ enum AICommitMessageError: LocalizedError {
 
     var provider: AICommitMessageProvider? {
         switch self {
+        case .notInstalledRemotely(let provider, _, _):
+            provider
         case .notInstalled(let provider),
              .brokenInstallation(let provider),
              .notAuthenticated(let provider),
@@ -771,7 +871,8 @@ enum AICommitMessageError: LocalizedError {
         switch self {
         case .invalidResponse(_, let details):
             details
-        case .executionFailed(_, let output):
+        case .notInstalledRemotely(_, _, let output),
+             .executionFailed(_, let output):
             output.flatMap { output in
                 let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
                 return trimmed.isEmpty ? nil : "Command output:\n\n\(trimmed)"

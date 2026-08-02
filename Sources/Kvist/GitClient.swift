@@ -234,6 +234,7 @@ struct RepositorySnapshot: Sendable {
     let behind: Int
     let hasUpstream: Bool
     let isRebaseInProgress: Bool
+    let activeOperation: GitOperation?
     let fastForwardReferenceIDs: Set<String>
     let historyOffset: Int
     let graphHasMore: Bool
@@ -262,6 +263,17 @@ private struct ReferenceSnapshot: Sendable {
     let referencesByCommitHash: [String: [GitReference]]
     let upstreamReference: GitReference?
     let headBranchName: String?
+}
+
+private struct RemoteRepositoryOverview: Sendable {
+    let status: RepositoryStatusSnapshot
+    let references: ReferenceSnapshot
+    let activeOperation: GitOperation?
+}
+
+struct RemoteCommandResult: Sendable {
+    let exitCode: Int32
+    let output: Data
 }
 
 private final class GitCommandOutputBuffer: @unchecked Sendable {
@@ -705,7 +717,7 @@ struct GitClient: Sendable {
             .path
         try runRsync([
             "-a",
-            "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10",
+            "-e", SSHConnection.rsyncRemoteShell,
             "\(sshRepository.host):\(Self.shellQuote(remotePath))",
             fileURL.path
         ])
@@ -718,7 +730,7 @@ struct GitClient: Sendable {
             .path
         try runRsync([
             "-a",
-            "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10",
+            "-e", SSHConnection.rsyncRemoteShell,
             fileURL.path,
             "\(sshRepository.host):\(Self.shellQuote(remotePath))"
         ])
@@ -729,9 +741,20 @@ struct GitClient: Sendable {
         historyScope: GitHistoryScope = .all
     ) throws -> RepositorySnapshot {
         try Task.checkCancellation()
-        let status = try repositoryStatusSnapshot()
-        try Task.checkCancellation()
-        let referenceSnapshot = try referenceSnapshot()
+        let status: RepositoryStatusSnapshot
+        let referenceSnapshot: ReferenceSnapshot
+        let activeOperation: GitOperation?
+        if sshRepository != nil {
+            let overview = try remoteRepositoryOverview()
+            status = overview.status
+            referenceSnapshot = overview.references
+            activeOperation = overview.activeOperation
+        } else {
+            status = try repositoryStatusSnapshot()
+            try Task.checkCancellation()
+            referenceSnapshot = try self.referenceSnapshot()
+            activeOperation = operationInProgress()
+        }
         let allReferences = referenceSnapshot.references
         let upstream = status.hasUpstream
             ? referenceSnapshot.upstreamReference
@@ -759,7 +782,7 @@ struct GitClient: Sendable {
             ? []
             : {
                 guard !Task.isCancelled else { return Set<String>() }
-                return fastForwardReferenceIDs()
+                return self.fastForwardReferenceIDs()
             }()
 
         try Task.checkCancellation()
@@ -776,7 +799,8 @@ struct GitClient: Sendable {
             ahead: status.ahead,
             behind: status.behind,
             hasUpstream: status.hasUpstream && upstream != nil,
-            isRebaseInProgress: rebaseIsInProgress(),
+            isRebaseInProgress: activeOperation == .rebase,
+            activeOperation: activeOperation,
             fastForwardReferenceIDs: fastForwardReferenceIDs,
             historyOffset: historyResult.nextOffset,
             graphHasMore: historyResult.hasMore,
@@ -789,13 +813,32 @@ struct GitClient: Sendable {
         maxGraphCount: Int = 50,
         historyScope: GitHistoryScope = .all
     ) async throws -> RepositorySnapshot {
-        async let statusValue = Task.detached(priority: .userInitiated) {
-            try repositoryStatusSnapshot()
-        }.value
-        async let referencesValue = Task.detached(priority: .userInitiated) {
-            try referenceSnapshot()
-        }.value
-        let (status, referenceSnapshot) = try await (statusValue, referencesValue)
+        let status: RepositoryStatusSnapshot
+        let referenceSnapshot: ReferenceSnapshot
+        let activeOperation: GitOperation?
+        if sshRepository != nil {
+            let overview = try await Task.detached(priority: .userInitiated) {
+                try remoteRepositoryOverview()
+            }.value
+            status = overview.status
+            referenceSnapshot = overview.references
+            activeOperation = overview.activeOperation
+        } else {
+            async let statusValue = Task.detached(priority: .userInitiated) {
+                try repositoryStatusSnapshot()
+            }.value
+            async let referencesValue = Task.detached(priority: .userInitiated) {
+                try self.referenceSnapshot()
+            }.value
+            async let operationValue = Task.detached(priority: .userInitiated) {
+                operationInProgress()
+            }.value
+            (status, referenceSnapshot, activeOperation) = try await (
+                statusValue,
+                referencesValue,
+                operationValue
+            )
+        }
         let upstream = status.hasUpstream
             ? referenceSnapshot.upstreamReference
             : nil
@@ -819,7 +862,7 @@ struct GitClient: Sendable {
             )
         }
         let fastForwardTask = Task.detached(priority: .userInitiated) {
-            status.headHash == nil ? Set<String>() : fastForwardReferenceIDs()
+            status.headHash == nil ? Set<String>() : self.fastForwardReferenceIDs()
         }
         let historyResult = try await historyTask.value
         let fastForwardReferenceIDs = await fastForwardTask.value
@@ -837,7 +880,8 @@ struct GitClient: Sendable {
             ahead: status.ahead,
             behind: status.behind,
             hasUpstream: status.hasUpstream && upstream != nil,
-            isRebaseInProgress: rebaseIsInProgress(),
+            isRebaseInProgress: activeOperation == .rebase,
+            activeOperation: activeOperation,
             fastForwardReferenceIDs: fastForwardReferenceIDs,
             historyOffset: historyResult.nextOffset,
             graphHasMore: historyResult.hasMore,
@@ -847,15 +891,31 @@ struct GitClient: Sendable {
     }
 
     func repositoryStatusSnapshot() throws -> RepositoryStatusSnapshot {
-        let output = try run([
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            // Keep large generated directories represented by a single item.
-            "--untracked-files=normal"
-        ])
-        let parsed = parseRepositoryStatus(output)
+        let output = try run(Self.repositoryStatusArguments)
+        return repositoryStatusSnapshot(
+            statusOutput: output,
+            resolveUndoOutput: try run(Self.resolveUndoArguments)
+        )
+    }
+
+    private static let repositoryStatusArguments = [
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "-z",
+        // Keep large generated directories represented by a single item.
+        "--untracked-files=normal"
+    ]
+
+    private static let resolveUndoArguments = [
+        "ls-files", "--resolve-undo", "-z"
+    ]
+
+    private func repositoryStatusSnapshot(
+        statusOutput: String,
+        resolveUndoOutput: String
+    ) -> RepositoryStatusSnapshot {
+        let parsed = parseRepositoryStatus(statusOutput)
         return RepositoryStatusSnapshot(
             branch: parsed.branch,
             headHash: parsed.headHash,
@@ -865,7 +925,7 @@ struct GitClient: Sendable {
             workingTree: WorkingTreeSnapshot(
                 staged: parsed.workingTree.staged,
                 unstaged: parsed.workingTree.unstaged,
-                resolveUndoPaths: try resolveUndoPaths()
+                resolveUndoPaths: Self.parseResolveUndoPaths(resolveUndoOutput)
             ),
             hasUpstream: parsed.hasUpstream
         )
@@ -1467,6 +1527,12 @@ struct GitClient: Sendable {
     }
 
     func operationInProgress() -> GitOperation? {
+        if let sshRepository {
+            guard let output = try? runSSH(
+                Self.remoteOperationCommand(path: sshRepository.path)
+            ) else { return nil }
+            return Self.parseOperation(String(decoding: output, as: UTF8.self))
+        }
         guard let gitDirectory = absoluteGitDirectory() else { return nil }
         let exists: (String) -> Bool = {
             FileManager.default.fileExists(
@@ -1478,6 +1544,30 @@ struct GitClient: Sendable {
         if exists("CHERRY_PICK_HEAD") { return .cherryPick }
         if exists("REVERT_HEAD") { return .revert }
         return nil
+    }
+
+    static func remoteOperationCommand(path: String) -> String {
+        let gitDirectoryCommand = remoteCommand(
+            path: path,
+            gitArguments: configuredGitArguments(["rev-parse", "--absolute-git-dir"])
+        )
+        let script = """
+        kvist_git_dir=$(\(gitDirectoryCommand)) || exit $?
+        if [ -d "$kvist_git_dir/rebase-merge" ] || [ -d "$kvist_git_dir/rebase-apply" ]; then
+          printf 'rebase\\n'
+        elif [ -f "$kvist_git_dir/MERGE_HEAD" ]; then
+          printf 'merge\\n'
+        elif [ -f "$kvist_git_dir/CHERRY_PICK_HEAD" ]; then
+          printf 'cherry-pick\\n'
+        elif [ -f "$kvist_git_dir/REVERT_HEAD" ]; then
+          printf 'revert\\n'
+        fi
+        """
+        return posixShellCommand(script)
+    }
+
+    private static func parseOperation(_ output: String) -> GitOperation? {
+        GitOperation(rawValue: output.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     func continueOperation(_ operation: GitOperation) throws -> String {
@@ -1523,18 +1613,43 @@ struct GitClient: Sendable {
     }
 
     func remotes() throws -> [GitRemote] {
-        let names = try run(["remote"])
-            .split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-        return try names.map { name in
-            let validName = try validatedRemoteName(name)
-            let fetchURL = try run(["remote", "get-url", validName])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let pushURL = try run(["remote", "get-url", "--push", validName])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return GitRemote(name: validName, fetchURL: fetchURL, pushURL: pushURL)
+        try Self.parseRemotes(run(["remote", "-v"]))
+    }
+
+    static func parseRemotes(_ output: String) throws -> [GitRemote] {
+        var values: [String: (fetch: String?, push: String?)] = [:]
+        for line in output.split(whereSeparator: \.isNewline) {
+            guard let separator = line.firstIndex(where: \.isWhitespace) else { continue }
+            let name = String(line[..<separator])
+            guard !name.isEmpty,
+                  !name.hasPrefix("-"),
+                  !name.contains("\r") else {
+                throw GitCommandError(command: "git remote -v", output: "Invalid remote name.")
+            }
+            let description = line[separator...]
+                .trimmingCharacters(in: .whitespaces)
+            let kind: String
+            if description.hasSuffix(" (fetch)") {
+                kind = "fetch"
+            } else if description.hasSuffix(" (push)") {
+                kind = "push"
+            } else {
+                continue
+            }
+            let url = String(description.dropLast(kind.count + 3))
+            var remote = values[name] ?? (nil, nil)
+            if kind == "fetch", remote.fetch == nil {
+                remote.fetch = url
+            } else if kind == "push", remote.push == nil {
+                remote.push = url
+            }
+            values[name] = remote
         }
+        return values.compactMap { name, value in
+            guard let fetchURL = value.fetch, let pushURL = value.push else { return nil }
+            return GitRemote(name: name, fetchURL: fetchURL, pushURL: pushURL)
+        }
+        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     func addRemote(name: String, url: String) throws {
@@ -2229,10 +2344,23 @@ struct GitClient: Sendable {
         let namespaces = includingInternalRefs
             ? ["refs"]
             : ["refs/heads", "refs/remotes", "refs/tags", "refs/stash"]
-        let output = try run([
+        let arguments = [
             "for-each-ref",
             "--format=%(refname)%09%(HEAD)%09%(upstream)%09%(objectname)%09%(*objectname)"
-        ] + namespaces)
+        ] + namespaces
+        return parseReferenceSnapshot(try run(arguments))
+    }
+
+    private static let standardReferenceArguments = [
+        "for-each-ref",
+        "--format=%(refname)%09%(HEAD)%09%(upstream)%09%(objectname)%09%(*objectname)",
+        "refs/heads",
+        "refs/remotes",
+        "refs/tags",
+        "refs/stash"
+    ]
+
+    private func parseReferenceSnapshot(_ output: String) -> ReferenceSnapshot {
         var upstreamID: String?
         var headBranchName: String?
         var referencesByCommitHash: [String: [GitReference]] = [:]
@@ -2887,7 +3015,10 @@ struct GitClient: Sendable {
     }
 
     private func resolveUndoPaths() throws -> Set<String> {
-        let output = try run(["ls-files", "--resolve-undo", "-z"])
+        Self.parseResolveUndoPaths(try run(Self.resolveUndoArguments))
+    }
+
+    private static func parseResolveUndoPaths(_ output: String) -> Set<String> {
         return Set(output.split(separator: "\0").compactMap { record in
             guard let separator = record.firstIndex(of: "\t") else { return nil }
             return String(record[record.index(after: separator)...])
@@ -3137,25 +3268,16 @@ struct GitClient: Sendable {
         let process = Process()
         let outputPipe = Pipe()
 
-        let gitArguments = [
-            "-c", "core.quotepath=false",
-            // Kvist owns refresh scheduling, so a command-triggered detached
-            // maintenance process only adds contention and self-watcher events.
-            "-c", "maintenance.auto=false",
-            "-c", "gc.auto=0"
-        ] + arguments
+        let gitArguments = Self.configuredGitArguments(arguments)
         if let sshRepository {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            process.arguments = [
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=10",
-                sshRepository.host,
-                "--",
-                Self.remoteCommand(
+            process.executableURL = SSHConnection.executableURL
+            process.arguments = SSHConnection.arguments(
+                host: sshRepository.host,
+                command: Self.remoteCommand(
                     path: sshRepository.path,
                     gitArguments: gitArguments
                 )
-            ]
+            )
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
             process.arguments = gitArguments
@@ -3215,6 +3337,16 @@ struct GitClient: Sendable {
         return output
     }
 
+    private static func configuredGitArguments(_ arguments: [String]) -> [String] {
+        [
+            "-c", "core.quotepath=false",
+            // Kvist owns refresh scheduling, so a command-triggered detached
+            // maintenance process only adds contention and self-watcher events.
+            "-c", "maintenance.auto=false",
+            "-c", "gc.auto=0"
+        ] + arguments
+    }
+
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
@@ -3239,18 +3371,122 @@ struct GitClient: Sendable {
             .joined(separator: " ")
     }
 
+    private func remoteRepositoryOverview() throws -> RemoteRepositoryOverview {
+        guard let sshRepository else {
+            throw GitCommandError(command: "ssh", output: "Missing SSH repository.")
+        }
+        let commands = [
+            Self.remoteCommand(
+                path: sshRepository.path,
+                gitArguments: Self.configuredGitArguments(Self.repositoryStatusArguments)
+            ),
+            Self.remoteCommand(
+                path: sshRepository.path,
+                gitArguments: Self.configuredGitArguments(Self.resolveUndoArguments)
+            ),
+            Self.remoteCommand(
+                path: sshRepository.path,
+                gitArguments: Self.configuredGitArguments(Self.standardReferenceArguments)
+            ),
+            Self.remoteOperationCommand(path: sshRepository.path)
+        ]
+        let labels = ["git status", "git ls-files", "git for-each-ref", "git rev-parse"]
+        let results = try runRemoteCommands(commands)
+        for (label, result) in zip(labels, results) where result.exitCode != 0 {
+            throw GitCommandError(
+                command: label,
+                output: String(decoding: result.output, as: UTF8.self)
+            )
+        }
+        guard results.count == commands.count else {
+            throw GitCommandError(command: "ssh", output: "Incomplete SSH response.")
+        }
+
+        let statusOutput = String(decoding: results[0].output, as: UTF8.self)
+        let resolveUndoOutput = String(decoding: results[1].output, as: UTF8.self)
+        let referenceOutput = String(decoding: results[2].output, as: UTF8.self)
+        let operationOutput = String(decoding: results[3].output, as: UTF8.self)
+        return RemoteRepositoryOverview(
+            status: repositoryStatusSnapshot(
+                statusOutput: statusOutput,
+                resolveUndoOutput: resolveUndoOutput
+            ),
+            references: parseReferenceSnapshot(referenceOutput),
+            activeOperation: Self.parseOperation(operationOutput)
+        )
+    }
+
+    private func runRemoteCommands(_ commands: [String]) throws -> [RemoteCommandResult] {
+        let data = try runSSH(Self.framedRemoteCommands(commands))
+        return try Self.parseRemoteCommandResults(data, expectedCount: commands.count)
+    }
+
+    static func framedRemoteCommands(_ commands: [String]) -> String {
+        var lines = [
+            "kvist_tmp=$(mktemp -d \"${TMPDIR:-/tmp}/kvist-git.XXXXXX\") || exit 1",
+            "trap 'rm -rf \"$kvist_tmp\"' 0 1 2 15"
+        ]
+        for command in commands {
+            lines += [
+                "(\n\(command)\n) >\"$kvist_tmp/output\" 2>&1",
+                "kvist_status=$?",
+                "kvist_size=$(wc -c <\"$kvist_tmp/output\" | tr -d '[:space:]')",
+                "printf '%s %s\\n' \"$kvist_status\" \"$kvist_size\"",
+                "cat \"$kvist_tmp/output\""
+            ]
+        }
+        return posixShellCommand(lines.joined(separator: "\n"))
+    }
+
+    private static func posixShellCommand(_ script: String) -> String {
+        "/bin/sh -c \(shellQuote(script))"
+    }
+
+    static func parseRemoteCommandResults(
+        _ data: Data,
+        expectedCount: Int
+    ) throws -> [RemoteCommandResult] {
+        var cursor = data.startIndex
+        var results: [RemoteCommandResult] = []
+        for _ in 0..<expectedCount {
+            guard cursor < data.endIndex,
+                  let newline = data[cursor...].firstIndex(of: 0x0A),
+                  let header = String(data: data[cursor..<newline], encoding: .utf8) else {
+                throw GitCommandError(command: "ssh", output: "Malformed SSH response.")
+            }
+            let fields = header.split(separator: " ")
+            guard fields.count == 2,
+                  let exitCode = Int32(fields[0]),
+                  let size = Int(fields[1]),
+                  size >= 0 else {
+                throw GitCommandError(command: "ssh", output: "Malformed SSH response header.")
+            }
+            cursor = data.index(after: newline)
+            guard let end = data.index(cursor, offsetBy: size, limitedBy: data.endIndex) else {
+                throw GitCommandError(command: "ssh", output: "Truncated SSH response.")
+            }
+            results.append(RemoteCommandResult(
+                exitCode: exitCode,
+                output: Data(data[cursor..<end])
+            ))
+            cursor = end
+        }
+        guard cursor == data.endIndex else {
+            throw GitCommandError(command: "ssh", output: "Unexpected SSH response data.")
+        }
+        return results
+    }
+
     private func runSSH(_ command: String) throws -> Data {
         guard let sshRepository else { return Data() }
         let process = Process()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = [
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            sshRepository.host,
-            "--", command
-        ]
+        process.executableURL = SSHConnection.executableURL
+        process.arguments = SSHConnection.arguments(
+            host: sshRepository.host,
+            command: command
+        )
         process.environment = Self.commandEnvironment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = outputPipe
@@ -3303,24 +3539,16 @@ struct GitClient: Sendable {
         let outputHandle = try FileHandle(forWritingTo: outputURL)
         defer { try? outputHandle.close() }
 
-        let gitArguments = [
-            "-c", "core.quotepath=false",
-            "-c", "maintenance.auto=false",
-            "-c", "gc.auto=0",
-            "cat-file", "blob", object
-        ]
+        let gitArguments = Self.configuredGitArguments(["cat-file", "blob", object])
         if let sshRepository {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            process.arguments = [
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=10",
-                sshRepository.host,
-                "--",
-                Self.remoteCommand(
+            process.executableURL = SSHConnection.executableURL
+            process.arguments = SSHConnection.arguments(
+                host: sshRepository.host,
+                command: Self.remoteCommand(
                     path: sshRepository.path,
                     gitArguments: gitArguments
                 )
-            ]
+            )
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
             process.arguments = gitArguments
