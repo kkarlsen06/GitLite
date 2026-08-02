@@ -2211,9 +2211,10 @@ struct RepositoryTerminalButton: View {
 @MainActor
 enum RepositoryLocationSymbol {
     static let image: NSImage? = {
-        guard let image = Bundle.kvistResources.image(
+        let image = Bundle.kvistResources.image(
             forResource: NSImage.Name("custom.folder.badge.eye")
-        ) else { return nil }
+        ) ?? NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        guard let image else { return nil }
         image.isTemplate = true
         return image
     }()
