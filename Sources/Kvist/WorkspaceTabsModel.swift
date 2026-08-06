@@ -125,7 +125,6 @@ final class RepositoryTab: ObservableObject, Identifiable {
             model.$expandedFileDirectories.map { _ in () }.eraseToAnyPublisher(),
             model.$expandedCommitHashes.map { _ in () }.eraseToAnyPublisher(),
             model.$graphScope.map { _ in () }.eraseToAnyPublisher(),
-            model.$isOutgoingExpanded.map { _ in () }.eraseToAnyPublisher(),
             model.$selectedRepositoryFilePath.map { _ in () }.eraseToAnyPublisher(),
             model.$isDiffPanelPresented.map { _ in () }.eraseToAnyPublisher(),
             model.$detailKind.map { _ in () }.eraseToAnyPublisher(),
@@ -388,6 +387,15 @@ final class WorkspaceTabsModel: ObservableObject {
         }
         let next = (index + offset + tabs.count) % tabs.count
         select(tabs[next].id)
+    }
+
+    func moveTab(_ tabID: UUID, toIndex targetIndex: Int) {
+        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        let destination = min(max(targetIndex, 0), tabs.count - 1)
+        guard destination != index else { return }
+        let tab = tabs.remove(at: index)
+        tabs.insert(tab, at: destination)
+        persistTabs()
     }
 
     func close(_ tabID: UUID) {

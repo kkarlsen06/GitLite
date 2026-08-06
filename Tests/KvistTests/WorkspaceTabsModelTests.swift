@@ -26,6 +26,37 @@ final class WorkspaceTabsModelTests: XCTestCase {
         XCTAssertEqual(tabsModel.activeTabID, firstTab.id)
     }
 
+    func testMoveTabReordersClampsAndPersists() {
+        let defaults = isolatedDefaults()
+        let tabsModel = WorkspaceTabsModel(
+            defaults: defaults,
+            restoreSavedTabs: false
+        )
+        tabsModel.addTab()
+        tabsModel.addTab()
+        let originalIDs = tabsModel.tabs.map(\.id)
+
+        tabsModel.moveTab(originalIDs[0], toIndex: 2)
+
+        XCTAssertEqual(
+            tabsModel.tabs.map(\.id),
+            [originalIDs[1], originalIDs[2], originalIDs[0]]
+        )
+
+        // Out-of-range destinations clamp instead of dropping the tab.
+        tabsModel.moveTab(originalIDs[0], toIndex: 99)
+        XCTAssertEqual(tabsModel.tabs.last?.id, originalIDs[0])
+        tabsModel.moveTab(originalIDs[0], toIndex: -5)
+        XCTAssertEqual(tabsModel.tabs.first?.id, originalIDs[0])
+        XCTAssertEqual(Set(tabsModel.tabs.map(\.id)), Set(originalIDs))
+
+        // Unknown tabs and no-op moves leave the order untouched.
+        let reordered = tabsModel.tabs.map(\.id)
+        tabsModel.moveTab(UUID(), toIndex: 0)
+        tabsModel.moveTab(reordered[1], toIndex: 1)
+        XCTAssertEqual(tabsModel.tabs.map(\.id), reordered)
+    }
+
     func testEditingAfterDocumentIsDirtyDoesNotInvalidateWorkspaceChrome() {
         let tabsModel = WorkspaceTabsModel(
             defaults: isolatedDefaults(),

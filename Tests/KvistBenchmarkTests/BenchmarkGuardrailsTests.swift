@@ -207,8 +207,8 @@ final class BenchmarkGuardrailsTests: XCTestCase {
             lifecycleCycles: 99
         )
         let app = AppArtifactResult(
-            bundleBytes: UInt64(2.751 * 1_048_576),
-            compressedBytes: UInt64(1.151 * 1_048_576)
+            bundleBytes: UInt64(InteractionBenchmarkLimits.bundleMiB * 1_048_576) + 1,
+            compressedBytes: UInt64(InteractionBenchmarkLimits.compressedMiB * 1_048_576) + 1
         )
         let guardrails = InteractionBenchmarkGuardrails.evaluate(
             app: app,

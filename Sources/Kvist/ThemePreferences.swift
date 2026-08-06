@@ -859,6 +859,9 @@ private enum ThemeImportError: LocalizedError {
 }
 
 enum EditorThemeImporter {
+    static let maximumExpandedArchiveSize = 200 * 1_024 * 1_024
+    static let maximumArchiveEntryCount = 20_000
+
     static func importVSIX(
         at archiveURL: URL,
         publisher: String,
@@ -874,6 +877,8 @@ enum EditorThemeImporter {
         )
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+
+        try validateArchiveExpansion(at: archiveURL)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
@@ -947,6 +952,53 @@ enum EditorThemeImporter {
             )
         }
         return content
+    }
+
+    static func validateArchiveExpansion(at archiveURL: URL) throws {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        process.arguments = ["-t", archiveURL.path]
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let summary = String(data: data, encoding: .utf8),
+              let totals = archiveExpansionTotals(summary: summary) else {
+            throw ThemeImportError.invalidArchive
+        }
+        guard totals.entries <= maximumArchiveEntryCount,
+              totals.bytes <= maximumExpandedArchiveSize else {
+            throw ThemeImportError.archiveTooLarge
+        }
+    }
+
+    static func archiveExpansionIsSafe(summary: String) -> Bool {
+        guard let totals = archiveExpansionTotals(summary: summary) else { return false }
+        return totals.entries <= maximumArchiveEntryCount
+            && totals.bytes <= maximumExpandedArchiveSize
+    }
+
+    private static func archiveExpansionTotals(
+        summary: String
+    ) -> (entries: Int, bytes: Int)? {
+        guard let match = try? NSRegularExpression(
+                pattern: #"(\d+) files?, ([\d,]+) bytes uncompressed"#
+              ).firstMatch(
+                in: summary,
+                range: NSRange(summary.startIndex..., in: summary)
+              ),
+              let entriesRange = Range(match.range(at: 1), in: summary),
+              let bytesRange = Range(match.range(at: 2), in: summary),
+              let entries = Int(summary[entriesRange]),
+              let expandedBytes = Int(
+                summary[bytesRange].replacingOccurrences(of: ",", with: "")
+              ) else {
+            return nil
+        }
+        return (entries, expandedBytes)
     }
 
     /// Parses an editor file-icon theme and copies the referenced SVG/PNG

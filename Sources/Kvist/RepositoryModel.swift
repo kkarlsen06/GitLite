@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CryptoKit
 import Foundation
 
 enum PrimaryRepositoryAction {
@@ -119,9 +120,6 @@ final class RepositoryModel: ObservableObject {
     @Published private(set) var expandedCommitHashes: Set<String> = []
     @Published private(set) var commitFilesByHash: [String: [CommitFileChange]] = [:]
     @Published private(set) var loadingCommitFileHashes: Set<String> = []
-    @Published private(set) var outgoingFiles: [CommitFileChange] = []
-    @Published private(set) var isOutgoingExpanded = false
-    @Published private(set) var isLoadingOutgoingFiles = false
     @Published private(set) var headHash: String?
     @Published private(set) var ahead = 0
     @Published private(set) var behind = 0
@@ -231,7 +229,6 @@ final class RepositoryModel: ObservableObject {
     private var openRequestID = UUID()
     private var activeOpenRequestID: UUID?
     private var snapshotRequestID = UUID()
-    private var outgoingFilesRequestID = UUID()
     private var repositoryWatcher: RepositoryWatcher?
     private var repositoryOpenLoadTask: Task<RepositoryOpenResult, Error>?
     private var repositoryCloneTask: Task<URL, Error>?
@@ -314,7 +311,8 @@ final class RepositoryModel: ObservableObject {
                 kind: detailKind,
                 isPanelPresented: isDiffPanelPresented,
                 diskModificationDate: repositoryFileDiskVersion?.contentModificationDate,
-                diskFileSize: repositoryFileDiskVersion?.fileSize
+                diskFileSize: repositoryFileDiskVersion?.fileSize,
+                diskContentHash: repositoryFileDiskVersion?.contentHash
             )
         }
         let rememberedEditor = repositoryFileSession.map {
@@ -328,7 +326,8 @@ final class RepositoryModel: ObservableObject {
                 kind: $0.kind,
                 isPanelPresented: $0.isPanelPresented,
                 diskModificationDate: $0.diskVersion?.contentModificationDate,
-                diskFileSize: $0.diskVersion?.fileSize
+                diskFileSize: $0.diskVersion?.fileSize,
+                diskContentHash: $0.diskVersion?.contentHash
             )
         }
         return RepositoryRestorationState(
@@ -336,7 +335,6 @@ final class RepositoryModel: ObservableObject {
             expandedFileDirectories: expandedFileDirectories,
             expandedCommitHashes: expandedCommitHashes,
             graphScope: graphScope,
-            isOutgoingExpanded: isOutgoingExpanded,
             commitMessage: commitMessage,
             editor: workspaceMode == .fileEditor ? activeEditor : rememberedEditor
         )
@@ -356,9 +354,6 @@ final class RepositoryModel: ObservableObject {
             }) else { continue }
             toggleCommitExpansion(commit)
         }
-        if state.isOutgoingExpanded, ahead > 0 {
-            toggleOutgoingExpansion()
-        }
 
         guard let editor = state.editor else {
             workspaceMode = state.workspaceMode
@@ -368,7 +363,8 @@ final class RepositoryModel: ObservableObject {
 
         let diskVersion = RepositoryFileDiskVersion(
             contentModificationDate: editor.diskModificationDate,
-            fileSize: editor.diskFileSize
+            fileSize: editor.diskFileSize,
+            contentHash: editor.diskContentHash
         )
         let session = RepositoryFileSession(
             path: editor.path,
@@ -791,7 +787,6 @@ final class RepositoryModel: ObservableObject {
             expandedCommitHashes = []
             commitFilesByHash = [:]
             loadingCommitFileHashes = []
-            resetOutgoingFiles()
             detailText = ""
             isDetailLoading = false
             repositoryFileText = ""
@@ -1210,81 +1205,6 @@ final class RepositoryModel: ObservableObject {
         expandedCommitHashes.remove(commit.hash)
         loadingCommitFileHashes.remove(commit.hash)
         commitFilesByHash.removeValue(forKey: commit.hash)
-    }
-
-    func toggleOutgoingExpansion() {
-        if isOutgoingExpanded {
-            isOutgoingExpanded = false
-            return
-        }
-
-        isOutgoingExpanded = true
-        guard outgoingFiles.isEmpty,
-              !isLoadingOutgoingFiles,
-              let repositoryURL else { return }
-
-        let requestID = UUID()
-        outgoingFilesRequestID = requestID
-        isLoadingOutgoingFiles = true
-        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
-        Task {
-            do {
-                let files = try await Task.detached(priority: .userInitiated) {
-                    try client.outgoingFiles()
-                }.value
-                guard outgoingFilesRequestID == requestID,
-                      self.repositoryURL == repositoryURL else { return }
-                outgoingFiles = files
-                isLoadingOutgoingFiles = false
-            } catch {
-                guard outgoingFilesRequestID == requestID,
-                      self.repositoryURL == repositoryURL else { return }
-                isLoadingOutgoingFiles = false
-                isOutgoingExpanded = false
-                present(error)
-            }
-        }
-    }
-
-    func selectOutgoingFile(_ file: CommitFileChange) {
-        clearGitFilePreview()
-        selectedChange = nil
-        selectedCommit = nil
-        selectedCommitFile = file
-        selectedRepositoryFilePath = nil
-        detailTitle = file.path
-        detailText = "Loading diff…"
-        detailKind = .diff
-        isDetailLoading = true
-        isDiffPanelPresented = true
-        let requestID = UUID()
-        detailRequestID = requestID
-
-        guard let repositoryURL else { return }
-        let client = GitClient(repositoryURL: repositoryURL, sshRepository: sshRepository)
-        Task {
-            do {
-                let result = try await Task.detached(priority: .userInitiated) {
-                    let output = try client.outgoingFileDiff(file)
-                    let preview = try? client.outgoingFilePreview(file)
-                    return (output, preview)
-                }.value
-                guard detailRequestID == requestID,
-                      self.repositoryURL == repositoryURL else {
-                    result.1?.removeTemporaryFiles()
-                    return
-                }
-                detailText = result.0.isEmpty ? "No textual diff available." : result.0
-                installGitFilePreview(result.1)
-                isDetailLoading = false
-            } catch {
-                guard detailRequestID == requestID,
-                      self.repositoryURL == repositoryURL else { return }
-                detailText = "Could not load this diff. Select the file again to retry."
-                isDetailLoading = false
-                present(error)
-            }
-        }
     }
 
     func select(_ file: CommitFileChange, in commit: CommitInfo) {
@@ -1911,16 +1831,6 @@ final class RepositoryModel: ObservableObject {
         }
     }
 
-    func activateOutgoingFile(_ file: CommitFileChange) {
-        if isDiffPanelPresented,
-           selectedCommit == nil,
-           selectedCommitFile?.id == file.id {
-            closeEditorPanel()
-        } else {
-            selectOutgoingFile(file)
-        }
-    }
-
     func activate(_ file: CommitFileChange, in commit: CommitInfo) {
         if isDiffPanelPresented,
            selectedCommit?.hash == commit.hash,
@@ -2069,26 +1979,16 @@ final class RepositoryModel: ObservableObject {
         }
         let text = repositoryFileText
         let fileRequestID = detailRequestID
+        guard let repositoryURL else { return }
+        let sshRepository = sshRepository
+        let relativePath = selectedRepositoryFilePath ?? fileURL.lastPathComponent
         do {
             try await Task.detached(priority: .userInitiated) {
-                guard let data = text.data(using: .utf8) else {
-                    throw CocoaError(.fileWriteInapplicableStringEncoding)
-                }
-                let handle = try FileHandle(forWritingTo: fileURL)
-                defer { try? handle.close() }
-                try handle.truncate(atOffset: 0)
-                try handle.write(contentsOf: data)
-                try handle.synchronize()
-            }.value
-            guard let repositoryURL else { return }
-            let sshRepository = sshRepository
-            let relativePath = selectedRepositoryFilePath ?? fileURL.lastPathComponent
-            try await Task.detached(priority: .userInitiated) {
-                try GitClient(
+                try Self.persistRepositoryFile(
+                    text,
+                    to: fileURL,
                     repositoryURL: repositoryURL,
-                    sshRepository: sshRepository
-                ).uploadSSHFile(
-                    fileURL,
+                    sshRepository: sshRepository,
                     relativePath: relativePath
                 )
             }.value
@@ -2198,14 +2098,13 @@ final class RepositoryModel: ObservableObject {
             scheduleWorkingTreeRefresh(delay: .zero)
         }
         do {
-            guard let data = draft.text.data(using: .utf8) else {
-                throw CocoaError(.fileWriteInapplicableStringEncoding)
-            }
-            let handle = try FileHandle(forWritingTo: fileURL)
-            defer { try? handle.close() }
-            try handle.truncate(atOffset: 0)
-            try handle.write(contentsOf: data)
-            try handle.synchronize()
+            try Self.persistRepositoryFile(
+                draft.text,
+                to: fileURL,
+                repositoryURL: repositoryURL,
+                sshRepository: sshRepository,
+                relativePath: draft.path
+            )
 
             if draft.isActive,
                selectedRepositoryFilePath == draft.path {
@@ -2223,6 +2122,23 @@ final class RepositoryModel: ObservableObject {
             present(error)
             return false
         }
+    }
+
+    nonisolated private static func persistRepositoryFile(
+        _ text: String,
+        to fileURL: URL,
+        repositoryURL: URL,
+        sshRepository: SSHRepository?,
+        relativePath: String
+    ) throws {
+        guard let data = text.data(using: .utf8) else {
+            throw CocoaError(.fileWriteInapplicableStringEncoding)
+        }
+        try data.write(to: fileURL, options: .atomic)
+        try GitClient(
+            repositoryURL: repositoryURL,
+            sshRepository: sshRepository
+        ).uploadSSHFile(fileURL, relativePath: relativePath)
     }
 
     private func rememberRepositoryFileSession() {
@@ -3715,11 +3631,6 @@ final class RepositoryModel: ObservableObject {
         _ snapshot: RepositorySnapshot,
         includeWorkingTree: Bool = true
     ) {
-        if headHash != snapshot.headHash
-            || upstreamReference?.id != snapshot.upstreamReference?.id
-            || ahead != snapshot.ahead {
-            resetOutgoingFiles()
-        }
         if branch != snapshot.branch { branch = snapshot.branch }
         if includeWorkingTree {
             applyWorkingTree(
@@ -3901,13 +3812,6 @@ final class RepositoryModel: ObservableObject {
 
     private func changeOrdering(_ lhs: FileChange, _ rhs: FileChange) -> Bool {
         lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
-    }
-
-    private func resetOutgoingFiles() {
-        outgoingFilesRequestID = UUID()
-        outgoingFiles = []
-        isOutgoingExpanded = false
-        isLoadingOutgoingFiles = false
     }
 
     private func applyGraph(_ page: GitHistoryPage, scope: GraphScope) {
@@ -4140,7 +4044,8 @@ final class RepositoryModel: ObservableObject {
                     message: presentation.message,
                     details: presentation.details
                 )
-            } else if let presentation = gitError.missingToolPresentation {
+            } else if let presentation = gitError.missingToolPresentation
+                ?? gitError.sshAuthenticationPresentation {
                 errorPresentation = RepositoryErrorPresentation(
                     title: presentation.title,
                     message: presentation.message,
@@ -4180,13 +4085,15 @@ private struct RepositoryFileDraft {
     let isActive: Bool
 }
 
-private struct RepositoryFileDiskVersion: Equatable {
+struct RepositoryFileDiskVersion: Equatable {
     let contentModificationDate: Date?
     let fileSize: Int?
+    let contentHash: String?
 
-    init(contentModificationDate: Date?, fileSize: Int?) {
+    init(contentModificationDate: Date?, fileSize: Int?, contentHash: String?) {
         self.contentModificationDate = contentModificationDate
         self.fileSize = fileSize
+        self.contentHash = contentHash
     }
 
     init(fileURL: URL) {
@@ -4196,6 +4103,11 @@ private struct RepositoryFileDiskVersion: Equatable {
         ])
         contentModificationDate = values?.contentModificationDate
         fileSize = values?.fileSize
+        contentHash = fileSize.map { $0 <= RepositoryFileLoader.maximumSourceFileSize } == true
+            ? (try? Data(contentsOf: fileURL, options: .mappedIfSafe)).map {
+                SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined()
+            }
+            : nil
     }
 }
 

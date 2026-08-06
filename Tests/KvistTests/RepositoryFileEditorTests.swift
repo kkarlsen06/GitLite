@@ -5,6 +5,24 @@ import XCTest
 @testable import Kvist
 
 final class RepositoryFileEditorTests: XCTestCase {
+    func testDiskVersionDetectsSameSizeEditWithPreservedTimestamp() throws {
+        let fileURL = repositoryURL.appendingPathComponent("Version.txt")
+        try "first\n".write(to: fileURL, atomically: true, encoding: .utf8)
+        let modificationDate = try XCTUnwrap(
+            fileURL.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate
+        )
+        let original = RepositoryFileDiskVersion(fileURL: fileURL)
+
+        try "other\n".write(to: fileURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: modificationDate],
+            ofItemAtPath: fileURL.path
+        )
+
+        XCTAssertNotEqual(original, RepositoryFileDiskVersion(fileURL: fileURL))
+    }
+
     private var repositoryURL: URL!
 
     override func setUpWithError() throws {

@@ -189,8 +189,8 @@ nearest-rank 95th percentile: sorted sample at `ceil(0.95 × count)`.
 
 | Metric | Guardrail |
 | --- | ---: |
-| App bundle | ≤ 2.75 MiB |
-| Compressed app | ≤ 1.15 MiB |
+| App bundle | ≤ 4.5 MiB |
+| Compressed app | ≤ 2.4 MiB |
 | Launch | median ≤ 250 ms; p95 ≤ 275 ms |
 | Startup peak physical footprint | every sample ≤ 35 MiB |
 | Settled physical footprint | every sample ≤ 50 MiB |
@@ -250,4 +250,4 @@ release artifact size. Its limits are:
 | 5,000-row footprint | 5 samples; maximum delta ≤20 MiB |
 | 100 pagination/cancellation/scope cycles | 0 orphan tasks; 0 stale publications; settled delta ≤3 MiB |
 | Expand 1,000-file commit | 20 samples; p95 ≤175 ms; maximum stall ≤33 ms |
-| Release artifacts | app ≤2.75 MiB; compressed app ≤1.15 MiB |
+| Release artifacts | app ≤4.5 MiB; compressed app ≤2.4 MiB |

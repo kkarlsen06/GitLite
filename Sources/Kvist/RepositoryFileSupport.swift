@@ -47,6 +47,7 @@ struct RepositoryEditorRestorationState: Codable, Equatable {
     let isPanelPresented: Bool
     let diskModificationDate: Date?
     let diskFileSize: Int?
+    let diskContentHash: String?
 
     var isDirty: Bool {
         kind == .source && fileText != savedFileText
@@ -58,7 +59,6 @@ struct RepositoryRestorationState: Codable, Equatable {
     var expandedFileDirectories: Set<String> = []
     var expandedCommitHashes: Set<String> = []
     var graphScope: GraphScope = .all
-    var isOutgoingExpanded = false
     var commitMessage = ""
     var editor: RepositoryEditorRestorationState?
 }

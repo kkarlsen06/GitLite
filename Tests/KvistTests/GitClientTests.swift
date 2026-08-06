@@ -46,6 +46,7 @@ final class GitClientTests: XCTestCase {
             [
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=10",
+                "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ControlMaster=auto",
                 "-o", "ControlPersist=120",
                 "-o", "ControlPath=/Users/kvist test/Library/Caches/Kvist/SSH/%C"
@@ -53,8 +54,22 @@ final class GitClientTests: XCTestCase {
         )
         XCTAssertEqual(
             SSHConnection.options(controlDirectory: nil),
-            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "StrictHostKeyChecking=accept-new"
+            ]
         )
+    }
+
+    func testSSHAuthenticationFailureHasActionablePresentation() throws {
+        let presentation = try XCTUnwrap(GitCommandError(
+            command: "ssh deploy@example.com",
+            output: "Permission denied (publickey)."
+        ).sshAuthenticationPresentation)
+
+        XCTAssertEqual(presentation.title, "SSH Authentication Failed")
+        XCTAssertTrue(presentation.message.contains("macOS Keychain"))
     }
 
     func testSSHRemoteShellQuotesControlPathForRsync() {
@@ -1846,13 +1861,6 @@ final class GitClientTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(25))
         }
         XCTAssertFalse(model.expandedCommitHashes.contains(invalidCommit.hash))
-
-        model.errorMessage = nil
-        model.toggleOutgoingExpansion()
-        while model.isLoadingOutgoingFiles, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        XCTAssertFalse(model.isOutgoingExpanded)
     }
 
     @MainActor

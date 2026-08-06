@@ -350,6 +350,9 @@ struct GitCommandError: LocalizedError, Sendable {
         if let presentation = missingToolPresentation {
             return presentation.message
         }
+        if let presentation = sshAuthenticationPresentation {
+            return presentation.message
+        }
         let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return detail.isEmpty ? "Git command failed: \(command)" : detail
     }
@@ -371,6 +374,22 @@ struct GitCommandError: LocalizedError, Sendable {
             title: title,
             message: message,
             details: details
+        )
+    }
+
+    var sshAuthenticationPresentation: MissingToolPresentation? {
+        let lowercased = output.lowercased()
+        guard lowercased.contains("permission denied")
+                && (lowercased.contains("publickey") || command.hasPrefix("ssh")) else {
+            return nil
+        }
+        let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return MissingToolPresentation(
+            title: "SSH Authentication Failed",
+            message: "Kvist could not authenticate with the keys available through your SSH configuration, agent, or macOS Keychain. Add the key there and try again; Kvist does not store SSH passwords.",
+            details: detail.isEmpty
+                ? "Command: \(command)"
+                : "Command: \(command)\n\n\(detail)"
         )
     }
 
@@ -449,6 +468,8 @@ struct SSHFileEntry: Sendable {
 }
 
 struct GitClient: Sendable {
+    private static let networkOperationTimeout: TimeInterval = 120
+
     let repositoryURL: URL
     let sshRepository: SSHRepository?
 
@@ -606,7 +627,7 @@ struct GitClient: Sendable {
         do {
             _ = try GitClient(repositoryURL: parent).run([
                 "clone", "--", source, destination.path
-            ])
+            ], timeout: 300)
         } catch {
             // Git creates the destination before transferring objects. Remove
             // only a directory that did not exist before this clone attempt;
@@ -1494,28 +1515,71 @@ struct GitClient: Sendable {
         try run(["commit", "--amend", "--no-edit"])
     }
 
-    func fetch() throws -> String {
-        try run(["fetch", "--all", "--prune"])
+    func fetch(timeout: TimeInterval = Self.networkOperationTimeout) throws -> String {
+        do {
+            return try run(
+                ["fetch", "--all", "--prune"],
+                timeout: timeout
+            )
+        } catch let error as GitCommandError {
+            let marker = "couldn't find remote ref "
+            guard let markerRange = error.output.range(of: marker),
+                  let missingRef = error.output[markerRange.upperBound...]
+                    .split(whereSeparator: { $0.isNewline }).first else {
+                throw error
+            }
+
+            var repaired = false
+            for remote in try run(["remote"]).split(whereSeparator: { $0.isNewline }) {
+                let configKey = "remote.\(remote).fetch"
+                let fetchSpecs = try run(
+                    ["config", "--get-all", configKey],
+                    allowedExitCodes: [0, 1]
+                ).split(whereSeparator: { $0.isNewline })
+                guard let staleSpec = fetchSpecs.first(where: {
+                    $0.split(separator: ":", maxSplits: 1).first?
+                        .trimmingPrefix("+") == missingRef
+                }) else { continue }
+                let wildcard = "+refs/heads/*:refs/remotes/\(remote)/*"
+                if fetchSpecs.contains(Substring(wildcard)) {
+                    _ = try run([
+                        "config", "--fixed-value", "--unset-all",
+                        configKey, String(staleSpec)
+                    ])
+                } else {
+                    _ = try run([
+                        "config", "--fixed-value", "--replace-all",
+                        configKey, wildcard, String(staleSpec)
+                    ])
+                }
+                repaired = true
+            }
+            guard repaired else { throw error }
+            return try run(
+                ["fetch", "--all", "--prune"],
+                timeout: timeout
+            )
+        }
     }
 
     func pull() throws -> String {
-        try run(["pull"])
+        try run(["pull"], timeout: Self.networkOperationTimeout)
     }
 
     func pullRebasing() throws -> String {
-        try run(["pull", "--rebase"])
+        try run(["pull", "--rebase"], timeout: Self.networkOperationTimeout)
     }
 
     func push() throws -> String {
-        try run(["push"])
+        try run(["push"], timeout: Self.networkOperationTimeout)
     }
 
     func forcePushWithLease() throws -> String {
-        try run(["push", "--force-with-lease"])
+        try run(["push", "--force-with-lease"], timeout: Self.networkOperationTimeout)
     }
 
     func forcePush() throws -> String {
-        try run(["push", "--force"])
+        try run(["push", "--force"], timeout: Self.networkOperationTimeout)
     }
 
     func rebaseIsInProgress() -> Bool {
@@ -1682,7 +1746,10 @@ struct GitClient: Sendable {
     }
 
     func publish(branch: String) throws -> String {
-        try run(["push", "--set-upstream", "origin", branch])
+        try run(
+            ["push", "--set-upstream", "origin", branch],
+            timeout: Self.networkOperationTimeout
+        )
     }
 
     func sync() throws -> String {
@@ -1840,74 +1907,6 @@ struct GitClient: Sendable {
             renameArguments[noRenamesIndex] = "-M"
         }
         return parseCommitFiles(try run(renameArguments, allowedExitCodes: [0, 1]))
-    }
-
-    func outgoingFiles() throws -> [CommitFileChange] {
-        let range = try outgoingComparisonRange()
-        return parseCommitFiles(try run([
-            "diff",
-            "--name-status",
-            "-z",
-            "--no-ext-diff",
-            "--find-renames",
-            range
-        ], allowedExitCodes: [0, 1]))
-    }
-
-    func outgoingFileDiff(_ file: CommitFileChange) throws -> String {
-        let range = try outgoingComparisonRange()
-        let paths = [file.previousPath, file.path]
-            .compactMap { $0 }
-            .reduce(into: [String]()) { result, path in
-                if !result.contains(path) {
-                    result.append(path)
-                }
-            }
-        return try run([
-            "diff",
-            "--no-ext-diff",
-            "--find-renames",
-            range,
-            "--"
-        ] + paths, allowedExitCodes: [0, 1])
-    }
-
-    func outgoingFilePreview(_ file: CommitFileChange) throws -> GitFilePreview? {
-        let endpoints = try outgoingComparisonEndpoints()
-        let oldPath = file.previousPath ?? file.path
-        return try GitFilePreviewMaterializer.make(
-            old: file.status == "A"
-                ? nil
-                : .blob(object: "\(endpoints.oldRevision):\(oldPath)", path: oldPath),
-            new: file.status == "D"
-                ? nil
-                : .blob(object: "HEAD:\(file.path)", path: file.path),
-            oldContext: endpoints.oldContext,
-            newContext: "HEAD",
-            client: self
-        )
-    }
-
-    private func outgoingComparisonRange() throws -> String {
-        let endpoints = try outgoingComparisonEndpoints()
-        return "\(endpoints.oldRevision)..HEAD"
-    }
-
-    private func outgoingComparisonEndpoints() throws -> (
-        oldRevision: String,
-        oldContext: String
-    ) {
-        let mergeBase = try run(
-            ["merge-base", "@{upstream}", "HEAD"],
-            allowedExitCodes: [0, 1]
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Independently initialized local and remote repositories have no
-        // merge base. A direct tree comparison still provides a useful net
-        // file list without surfacing Git's fatal triple-dot error.
-        return mergeBase.isEmpty
-            ? ("@{upstream}", "Upstream")
-            : (mergeBase, "Merge Base")
     }
 
     func commitDiff(hash: String) throws -> String {
@@ -3263,7 +3262,8 @@ struct GitClient: Sendable {
     @discardableResult
     private func run(
         _ arguments: [String],
-        allowedExitCodes: Set<Int32> = [0]
+        allowedExitCodes: Set<Int32> = [0],
+        timeout: TimeInterval? = nil
     ) throws -> String {
         let process = Process()
         let outputPipe = Pipe()
@@ -3314,15 +3314,35 @@ struct GitClient: Sendable {
             outputCompletion.signal()
         }
 
+        let deadline = timeout.map { Date().addingTimeInterval($0) }
         var wasCancelled = false
+        var timedOut = false
+        var terminationDeadline: Date?
         while completion.wait(timeout: .now() + .milliseconds(20)) == .timedOut {
-            if Task.isCancelled {
+            if Task.isCancelled || deadline.map({ Date() >= $0 }) == true {
+                timedOut = !Task.isCancelled
                 wasCancelled = true
-                process.terminate()
+                if terminationDeadline == nil {
+                    process.terminate()
+                    terminationDeadline = Date().addingTimeInterval(2)
+                } else if Date() >= terminationDeadline! {
+                    kill(process.processIdentifier, SIGKILL)
+                }
             }
         }
         process.waitUntilExit()
+        if timedOut { try? outputHandle.close() }
         outputCompletion.wait()
+        if !Task.isCancelled, deadline.map({ Date() >= $0 }) == true {
+            timedOut = true
+        }
+        if timedOut {
+            let seconds = Int(timeout ?? 0)
+            throw GitCommandError(
+                command: "git \(arguments.joined(separator: " "))",
+                output: "The Git operation timed out after \(seconds) seconds. Check the network or remote host and try again."
+            )
+        }
         if wasCancelled || Task.isCancelled {
             throw CancellationError()
         }

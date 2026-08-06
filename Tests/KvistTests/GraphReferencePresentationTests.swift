@@ -66,6 +66,59 @@ final class GraphReferencePresentationTests: XCTestCase {
         )
     }
 
+    func testRemoteBranchOnSameCommitFoldsIntoItsLocalBranchPill() {
+        let references = [
+            reference(
+                id: "refs/remotes/origin/main",
+                name: "origin/main",
+                kind: .remoteBranch
+            ),
+            reference(
+                id: "refs/heads/main",
+                name: "main",
+                kind: .localBranch,
+                isHead: true
+            ),
+            reference(id: "refs/tags/v1.0", name: "v1.0", kind: .tag)
+        ]
+
+        let items = GraphReferencePresentation.displayItems(
+            references,
+            upstreamReferenceID: "refs/remotes/origin/main"
+        )
+
+        XCTAssertEqual(items.map(\.reference.name), ["main", "v1.0"])
+        XCTAssertEqual(
+            items.first?.syncedRemotes.map(\.name),
+            ["origin/main"]
+        )
+    }
+
+    func testRemoteBranchWithoutMatchingLocalStaysStandalone() {
+        let references = [
+            reference(
+                id: "refs/remotes/origin/main",
+                name: "origin/main",
+                kind: .remoteBranch
+            ),
+            reference(
+                id: "refs/heads/feature",
+                name: "feature",
+                kind: .localBranch
+            )
+        ]
+
+        let items = GraphReferencePresentation.displayItems(
+            references,
+            upstreamReferenceID: nil
+        )
+
+        XCTAssertEqual(items.map(\.reference.name), ["feature", "origin/main"])
+        XCTAssertTrue(items.allSatisfy { item in
+            item.syncedRemotes.isEmpty
+        })
+    }
+
     private func reference(
         id: String,
         name: String,

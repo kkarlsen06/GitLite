@@ -3,6 +3,19 @@ import XCTest
 @testable import Kvist
 
 final class ThemePreferencesTests: XCTestCase {
+    func testVSIXExpansionLimitsRejectLargeOrExcessiveArchives() {
+        XCTAssertTrue(EditorThemeImporter.archiveExpansionIsSafe(
+            summary: "10 files, 1,024 bytes uncompressed"
+        ))
+        XCTAssertFalse(EditorThemeImporter.archiveExpansionIsSafe(
+            summary: "10 files, 209,715,201 bytes uncompressed"
+        ))
+        XCTAssertFalse(EditorThemeImporter.archiveExpansionIsSafe(
+            summary: "20001 files, 1,024 bytes uncompressed"
+        ))
+        XCTAssertFalse(EditorThemeImporter.archiveExpansionIsSafe(summary: "invalid"))
+    }
+
     @MainActor
     func testAyuDarkIsTheDefaultTheme() {
         let suiteName = "ThemePreferencesTests-\(UUID().uuidString)"

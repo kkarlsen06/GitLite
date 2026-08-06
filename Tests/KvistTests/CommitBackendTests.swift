@@ -874,6 +874,50 @@ final class CommitBackendTests: XCTestCase {
         XCTAssertTrue(try client.remotes().isEmpty)
     }
 
+    func testFetchRecoversWhenSingleBranchRemoteWasDeleted() throws {
+        let client = GitClient(repositoryURL: repositoryURL)
+        let bareURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KvistDeletedRemoteBranch-\(UUID().uuidString).git")
+        defer { try? FileManager.default.removeItem(at: bareURL) }
+
+        try commitFile(path: "base.txt", contents: "base\n", message: "Base")
+        try git(["init", "--bare", bareURL.path])
+        try git(["remote", "add", "origin", bareURL.path])
+        try git(["push", "origin", "main"])
+        try git([
+            "config", "remote.origin.fetch",
+            "+refs/heads/deleted:refs/remotes/origin/deleted"
+        ])
+        try git([
+            "config", "--add", "remote.origin.fetch",
+            "+refs/pull/*/head:refs/remotes/origin/pull/*"
+        ])
+
+        _ = try client.fetch()
+
+        XCTAssertEqual(Set(
+            try git(["config", "--get-all", "remote.origin.fetch"])
+                .split(whereSeparator: { $0.isNewline }).map(String.init)
+        ), [
+            "+refs/heads/*:refs/remotes/origin/*",
+            "+refs/pull/*/head:refs/remotes/origin/pull/*"
+        ])
+        XCTAssertNoThrow(try git(["rev-parse", "--verify", "refs/remotes/origin/main"]))
+    }
+
+    func testFetchTimesOutInsteadOfRemainingBusy() throws {
+        let client = GitClient(repositoryURL: repositoryURL)
+        let bareURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KvistTimeoutRemote-\(UUID().uuidString).git")
+        defer { try? FileManager.default.removeItem(at: bareURL) }
+        try git(["init", "--bare", bareURL.path])
+        try git(["remote", "add", "origin", bareURL.path])
+
+        XCTAssertThrowsError(try client.fetch(timeout: 0)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("timed out"))
+        }
+    }
+
     func testCloneRepositoryUsesSafeDestinationAndReturnsRoot() throws {
         try commitFile(path: "README.md", contents: "# Clone me\n", message: "Initial")
         let cloneURL = FileManager.default.temporaryDirectory
@@ -1002,101 +1046,6 @@ final class CommitBackendTests: XCTestCase {
 
         model.openCommitChanges(commit)
         XCTAssertTrue(model.isDiffPanelPresented)
-    }
-
-    @MainActor
-    func testOutgoingChangesExpandToAllUnpushedFiles() async throws {
-        let bareURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("KvistOutgoingOrigin-\(UUID().uuidString).git")
-        defer { try? FileManager.default.removeItem(at: bareURL) }
-
-        try commitFile(path: "base.txt", contents: "base\n", message: "Base")
-        try git(["init", "--bare", bareURL.path])
-        try git(["remote", "add", "origin", bareURL.path])
-        try git(["push", "--set-upstream", "origin", "main"])
-
-        try commitFile(path: "first.txt", contents: "first\n", message: "First outgoing")
-        try commitFile(path: "second.txt", contents: "second\n", message: "Second outgoing")
-
-        let client = GitClient(repositoryURL: repositoryURL)
-        XCTAssertEqual(Set(try client.outgoingFiles().map(\.path)), ["first.txt", "second.txt"])
-        let firstFile = try XCTUnwrap(
-            try client.outgoingFiles().first { $0.path == "first.txt" }
-        )
-        let outgoingPreview = try XCTUnwrap(client.outgoingFilePreview(firstFile))
-        defer { outgoingPreview.removeTemporaryFiles() }
-        XCTAssertNil(outgoingPreview.old)
-        XCTAssertEqual(outgoingPreview.new?.context, "HEAD")
-        XCTAssertEqual(
-            try String(
-                contentsOf: XCTUnwrap(outgoingPreview.new?.url),
-                encoding: .utf8
-            ),
-            "first\n"
-        )
-
-        let model = RepositoryModel(
-            restoresLastRepository: false,
-            persistsLastRepository: false
-        )
-        await model.openRepository(repositoryURL)
-        XCTAssertEqual(model.ahead, 2)
-
-        model.toggleOutgoingExpansion()
-        XCTAssertTrue(model.isOutgoingExpanded)
-
-        let deadline = Date().addingTimeInterval(3)
-        while model.isLoadingOutgoingFiles, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(25))
-        }
-
-        XCTAssertEqual(Set(model.outgoingFiles.map(\.path)), ["first.txt", "second.txt"])
-        let file = try XCTUnwrap(model.outgoingFiles.first { $0.path == "first.txt" })
-        model.selectOutgoingFile(file)
-        while model.detailText == "Loading diff…", Date() < deadline {
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        XCTAssertTrue(model.detailText.contains("+first"))
-    }
-
-    func testOutgoingFilesFallBackForUnrelatedUpstreamHistory() throws {
-        let remoteWorkURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("KvistUnrelatedRemote-\(UUID().uuidString)")
-        let bareURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("KvistUnrelatedOrigin-\(UUID().uuidString).git")
-        defer {
-            try? FileManager.default.removeItem(at: remoteWorkURL)
-            try? FileManager.default.removeItem(at: bareURL)
-        }
-
-        try commitFile(path: "local.txt", contents: "local\n", message: "Local root")
-
-        try FileManager.default.createDirectory(
-            at: remoteWorkURL,
-            withIntermediateDirectories: true
-        )
-        try git(["init", "-b", "main"], in: remoteWorkURL)
-        try git(["config", "user.name", "Kvist Test"], in: remoteWorkURL)
-        try git(["config", "user.email", "kvist@example.invalid"], in: remoteWorkURL)
-        try "remote\n".write(
-            to: remoteWorkURL.appendingPathComponent("remote.txt"),
-            atomically: true,
-            encoding: .utf8
-        )
-        try git(["add", "."], in: remoteWorkURL)
-        try git(["commit", "-m", "Remote root"], in: remoteWorkURL)
-        try git(["init", "--bare", bareURL.path], in: remoteWorkURL)
-        try git(["remote", "add", "origin", bareURL.path], in: remoteWorkURL)
-        try git(["push", "origin", "main"], in: remoteWorkURL)
-
-        try git(["remote", "add", "origin", bareURL.path])
-        try git(["fetch", "origin"])
-        try git(["branch", "--set-upstream-to", "origin/main", "main"])
-
-        let client = GitClient(repositoryURL: repositoryURL)
-        let files = try client.outgoingFiles()
-        let localFile = try XCTUnwrap(files.first { $0.path == "local.txt" })
-        XCTAssertTrue(try client.outgoingFileDiff(localFile).contains("+local"))
     }
 
     @MainActor

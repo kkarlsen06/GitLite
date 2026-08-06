@@ -41,7 +41,10 @@ enum SSHConnection {
         if batchMode {
             arguments += ["-o", "BatchMode=yes"]
         }
-        arguments += ["-o", "ConnectTimeout=10"]
+        arguments += [
+            "-o", "ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=accept-new"
+        ]
         if let controlDirectory {
             arguments += [
                 "-o", "ControlMaster=auto",

@@ -86,8 +86,7 @@ enum AppTheme {
 enum AppType {
     /// Uppercase panel titles (CHANGES, GRAPH).
     static let panelTitle = Font.system(size: 13, weight: .semibold)
-    /// Section headers such as "Staged Changes" and pseudo-rows like
-    /// "Outgoing Changes".
+    /// Section headers such as "Staged Changes".
     static let sectionTitle = Font.system(size: 15, weight: .semibold)
     /// Primary row content: filenames and commit subjects.
     static let row = Font.system(size: 15)
@@ -105,8 +104,8 @@ enum AppType {
     static let nestedStatusLetter = Font.system(size: 12, weight: .semibold, design: .monospaced)
 }
 
-/// Shared file-type iconography so working-tree rows, outgoing rows, and
-/// history rows always render the same glyph for the same file.
+/// Shared file-type iconography so working-tree rows and history rows always
+/// render the same glyph for the same file.
 enum FileGlyph {
     static func symbol(forPath path: String) -> String {
         switch URL(fileURLWithPath: path).pathExtension.lowercased() {
@@ -500,7 +499,6 @@ private struct RepositoryStatusBar: View {
             || model.isGeneratingCommitMessage
             || model.hasPendingChangeOperations
             || model.isLoadingMoreGraph
-            || model.isLoadingOutgoingFiles
             || !model.loadingCommitFileHashes.isEmpty
     }
 
@@ -2211,8 +2209,9 @@ struct RepositoryTerminalButton: View {
 @MainActor
 enum RepositoryLocationSymbol {
     static let image: NSImage? = {
-        let image = Bundle.kvistResources.image(
-            forResource: NSImage.Name("custom.folder.badge.eye")
+        let image = NSImage(
+            systemSymbolName: "folder.badge.gearshape",
+            accessibilityDescription: nil
         ) ?? NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
         guard let image else { return nil }
         image.isTemplate = true
@@ -2701,6 +2700,11 @@ private struct WorkspaceView: View {
 private struct RepositoryTopBar: View {
     @EnvironmentObject private var tabsModel: WorkspaceTabsModel
     @State private var pendingTabScroll: DispatchWorkItem?
+    @StateObject private var dragState = TabDragState()
+
+    /// Coordinate space of the whole bar; tab frames are reported in it so
+    /// the AppKit drag area behind the bar can hit-test tabs for ⌘-drag.
+    static let coordinateSpaceName = "repositoryTopBar"
 
     // Leading inset that clears the traffic lights now that the bar sits in
     // the titlebar region of the full-size-content window.
@@ -2738,11 +2742,25 @@ private struct RepositoryTopBar: View {
         .padding(.trailing, 4)
         .frame(height: 34)
         .frame(maxWidth: .infinity)
+        .coordinateSpace(name: Self.coordinateSpaceName)
         // No divider under the strip: a dark line there reads as the bar
         // casting shade on the content, which pushes the panel (and the tab
         // merged into it) visually behind the bar. The recessed strip color
         // alone defines the boundary, keeping tab + panel one front surface.
-        .background(WindowDragArea())
+        .backgroundPreferenceValue(TabFramesPreferenceKey.self) { frames in
+            WindowDragArea(
+                orderedTabIDs: tabsModel.tabs.map(\.id),
+                tabFrames: frames,
+                dragState: dragState,
+                selectTab: { tabsModel.select($0) },
+                // The strip already renders drag-shifted positions, so the
+                // committed order change must not animate: the reordered
+                // layout lands exactly where the tabs are drawn.
+                moveTab: { tabID, index in
+                    tabsModel.moveTab(tabID, toIndex: index)
+                }
+            )
+        }
         .background(AppTheme.tabStripFill)
         // Confine the active tab's shadow to the bar so it never smudges the
         // panel below the divider, where the tab merges with the content.
@@ -2753,7 +2771,8 @@ private struct RepositoryTopBar: View {
         ForEach(tabsModel.tabs) { tab in
             RepositoryTabItem(
                 tab: tab,
-                isActive: tab.id == tabsModel.activeTabID
+                isActive: tab.id == tabsModel.activeTabID,
+                dragState: dragState
             )
             .id(tab.id)
         }
@@ -2787,11 +2806,213 @@ private struct RepositoryTopBar: View {
     }
 }
 
+/// Live state of an in-progress tab drag. The event monitor in
+/// `WindowDragArea` writes to it; the tab items read it to render the dragged
+/// tab under the pointer and slide its neighbors aside. The model's order is
+/// untouched until the drop, so the layout (and the tab frames captured at
+/// drag start) stays stable for the whole gesture.
+@MainActor
+final class TabDragState: ObservableObject {
+    @Published private(set) var draggedTabID: UUID?
+    @Published private(set) var pointerX: CGFloat = 0
+    private var grabOffsetX: CGFloat = 0
+    private var frames: [UUID: CGRect] = [:]
+    private var order: [UUID] = []
+
+    /// Spacing of the tab strip's HStack; a neighbor making room for the
+    /// dragged tab moves by the tab's width plus this.
+    private let stripSpacing: CGFloat = 3
+
+    var isDragging: Bool { draggedTabID != nil }
+
+    func begin(
+        tabID: UUID,
+        pointerX: CGFloat,
+        frames: [UUID: CGRect],
+        order: [UUID]
+    ) {
+        guard let frame = frames[tabID] else { return }
+        self.frames = frames
+        self.order = order
+        grabOffsetX = pointerX - frame.minX
+        self.pointerX = pointerX
+        draggedTabID = tabID
+    }
+
+    func update(pointerX: CGFloat) {
+        guard isDragging else { return }
+        self.pointerX = pointerX
+    }
+
+    func end() {
+        draggedTabID = nil
+        frames = [:]
+        order = []
+    }
+
+    /// Index the dragged tab would land at if dropped now: the number of
+    /// other tabs whose midpoint sits left of the dragged tab's visual
+    /// center. In the lazy scrolling strip, tabs scrolled out of view report
+    /// no frame; those before the first laid-out tab are to the left, so
+    /// they count toward the index as well.
+    var targetIndex: Int {
+        guard let draggedTabID,
+              let draggedFrame = frames[draggedTabID] else { return 0 }
+        let center = pointerX - grabOffsetX + draggedFrame.width / 2
+        let others = order.filter { $0 != draggedTabID }
+        let hiddenLeadingCount = others.firstIndex {
+            frames[$0] != nil
+        } ?? others.count
+        return hiddenLeadingCount + others
+            .compactMap { frames[$0]?.midX }
+            .count { $0 < center }
+    }
+
+    /// Visual x-offset for a tab while a drag is in progress. The dragged
+    /// tab tracks the pointer; a neighbor shifts one slot when it is between
+    /// the dragged tab's original index and its current target index.
+    func offsetX(for tabID: UUID) -> CGFloat {
+        guard let draggedTabID,
+              let draggedFrame = frames[draggedTabID],
+              let draggedIndex = order.firstIndex(of: draggedTabID) else {
+            return 0
+        }
+        if tabID == draggedTabID {
+            // Keep the dragged tab inside the strip even when the pointer
+            // overshoots it.
+            let stripMinX = frames.values.map(\.minX).min() ?? draggedFrame.minX
+            let stripMaxX = frames.values.map(\.maxX).max() ?? draggedFrame.maxX
+            let desiredLeft = min(
+                max(pointerX - grabOffsetX, stripMinX),
+                stripMaxX - draggedFrame.width
+            )
+            return desiredLeft - draggedFrame.minX
+        }
+        guard let index = order.firstIndex(of: tabID) else { return 0 }
+        let slot = draggedFrame.width + stripSpacing
+        let othersIndex = index > draggedIndex ? index - 1 : index
+        let makesRoom: CGFloat = othersIndex >= targetIndex ? slot : 0
+        let alreadyAfter: CGFloat = othersIndex >= draggedIndex ? slot : 0
+        return makesRoom - alreadyAfter
+    }
+}
+
 /// Transparent view behind the tab row's content that restores the standard
 /// titlebar behaviors — window dragging and double-click zoom/minimize — for
 /// the empty areas of the bar, since it now occupies the titlebar region.
+///
+/// It also implements drag-to-reorder for the tabs. That cannot live in the
+/// SwiftUI layer or in an AppKit subview: the hosting hierarchy swallows
+/// modified clicks before they reach tab buttons, gestures, or any overlay's
+/// `hitTest`, and a drag that begins on a button belongs to that button. A
+/// local event monitor sees every event ahead of dispatch: presses on a tab
+/// pass through untouched (so click-to-select and the close button keep
+/// working), and once the pointer moves past a small threshold the monitor
+/// claims the rest of the sequence and drives `TabDragState`. This view
+/// spans the whole bar, so converting event locations into its (flipped)
+/// bounds yields the same coordinates as the tab frames reported in the
+/// bar's named coordinate space — one coordinate system, pure AppKit
+/// conversion.
 private struct WindowDragArea: NSViewRepresentable {
+    var orderedTabIDs: [UUID]
+    var tabFrames: [UUID: CGRect]
+    var dragState: TabDragState
+    var selectTab: (UUID) -> Void
+    var moveTab: (UUID, Int) -> Void
+
     final class DragView: NSView {
+        var orderedTabIDs: [UUID] = []
+        var tabFrames: [UUID: CGRect] = [:]
+        var dragState: TabDragState?
+        var selectTab: ((UUID) -> Void)?
+        var moveTab: ((UUID, Int) -> Void)?
+        private var reorderMonitor: Any?
+        private var pendingTabID: UUID?
+        private var pendingStartX: CGFloat = 0
+
+        /// Horizontal movement, in points, that turns a press on a tab into
+        /// a reorder drag instead of a click.
+        private let dragThreshold: CGFloat = 4
+
+        // Match SwiftUI's top-left-origin coordinates so event locations can
+        // be compared against the tab frames from the bar's named space.
+        override var isFlipped: Bool { true }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            teardownMonitor()
+            guard window != nil else { return }
+            reorderMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+            ) { [weak self] event in
+                self?.handleReorder(event) ?? event
+            }
+        }
+
+        deinit {
+            teardownMonitor()
+        }
+
+        private func teardownMonitor() {
+            if let reorderMonitor {
+                NSEvent.removeMonitor(reorderMonitor)
+            }
+            reorderMonitor = nil
+            pendingTabID = nil
+        }
+
+        /// Tracks presses on tabs; consumes the mouse sequence only once a
+        /// drag is in progress, returning every other event unchanged.
+        private func handleReorder(_ event: NSEvent) -> NSEvent? {
+            guard let window, event.window === window else { return event }
+            let pointerX = convert(event.locationInWindow, from: nil).x
+            switch event.type {
+            case .leftMouseDown:
+                guard let tabID = tabID(at: event) else { return event }
+                pendingTabID = tabID
+                pendingStartX = pointerX
+                return event
+            case .leftMouseDragged:
+                if let dragState, dragState.isDragging {
+                    dragState.update(pointerX: pointerX)
+                    return nil
+                }
+                guard let pendingTabID,
+                      abs(pointerX - pendingStartX) >= dragThreshold else {
+                    return event
+                }
+                // The grabbed tab activates, matching a plain click.
+                selectTab?(pendingTabID)
+                dragState?.begin(
+                    tabID: pendingTabID,
+                    pointerX: pointerX,
+                    frames: tabFrames,
+                    order: orderedTabIDs
+                )
+                self.pendingTabID = nil
+                return nil
+            case .leftMouseUp:
+                pendingTabID = nil
+                guard let dragState, dragState.isDragging,
+                      let draggedTabID = dragState.draggedTabID else {
+                    return event
+                }
+                moveTab?(draggedTabID, dragState.targetIndex)
+                dragState.end()
+                // Swallow the up: the press passed through to the tab's
+                // buttons, and completing it here could re-click whatever
+                // ended under the pointer (notably the close button).
+                return nil
+            default:
+                return event
+            }
+        }
+
+        private func tabID(at event: NSEvent) -> UUID? {
+            let local = convert(event.locationInWindow, from: nil)
+            return orderedTabIDs.first { tabFrames[$0]?.contains(local) == true }
+        }
+
         override func mouseDown(with event: NSEvent) {
             guard let window else { return }
             if event.clickCount == 2 {
@@ -2809,11 +3030,37 @@ private struct WindowDragArea: NSViewRepresentable {
         }
     }
 
-    func makeNSView(context: Context) -> NSView {
-        DragView()
+    func makeNSView(context: Context) -> DragView {
+        let view = DragView()
+        apply(to: view)
+        return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    func updateNSView(_ nsView: DragView, context: Context) {
+        apply(to: nsView)
+    }
+
+    private func apply(to view: DragView) {
+        view.orderedTabIDs = orderedTabIDs
+        view.tabFrames = tabFrames
+        view.dragState = dragState
+        view.selectTab = selectTab
+        view.moveTab = moveTab
+    }
+}
+
+/// Frames of each tab, keyed by tab ID, in the top bar's named coordinate
+/// space. Reported by `RepositoryTabItem` and consumed by `WindowDragArea`
+/// to hit-test tabs during ⌘-drag reordering.
+private struct TabFramesPreferenceKey: PreferenceKey {
+    static let defaultValue: [UUID: CGRect] = [:]
+
+    static func reduce(
+        value: inout [UUID: CGRect],
+        nextValue: () -> [UUID: CGRect]
+    ) {
+        value.merge(nextValue()) { _, new in new }
+    }
 }
 
 /// Concave quarter-circle fillet drawn just outside the active tab's base so
@@ -2847,16 +3094,26 @@ private struct TabBaseFillet: Shape {
 private struct RepositoryTabItem: View {
     @EnvironmentObject private var tabsModel: WorkspaceTabsModel
     @ObservedObject var tab: RepositoryTab
+    @ObservedObject var dragState: TabDragState
     let tabID: UUID
     let tabName: String
     let isActive: Bool
     @State private var hovering = false
 
-    init(tab: RepositoryTab, isActive: Bool) {
+    init(tab: RepositoryTab, isActive: Bool, dragState: TabDragState) {
         _tab = ObservedObject(wrappedValue: tab)
+        _dragState = ObservedObject(wrappedValue: dragState)
         tabID = tab.id
         tabName = tab.displayName
         self.isActive = isActive
+    }
+
+    private var isDragged: Bool {
+        dragState.draggedTabID == tabID
+    }
+
+    private var dragOffsetX: CGFloat {
+        dragState.offsetX(for: tabID)
     }
 
     var body: some View {
@@ -2951,6 +3208,34 @@ private struct RepositoryTabItem: View {
         }
         .padding(.bottom, isActive ? 0 : 5)
         .frame(height: 34, alignment: .bottom)
+        // The offset comes before the frame-reporting background: modifiers
+        // after .offset see the untranslated layout frame, so the reported
+        // tab frames stay stable for hit-testing while the drag renders the
+        // tab under the pointer.
+        .offset(x: dragOffsetX)
+        // Neighbors ease aside while a drag is in progress; the dragged tab
+        // tracks the pointer directly. On drop everything changes in one
+        // unanimated pass so the committed order lands exactly where the
+        // tabs are already drawn.
+        .animation(
+            dragState.isDragging && !isDragged
+                ? .easeInOut(duration: 0.13)
+                : nil,
+            value: dragOffsetX
+        )
+        .zIndex(isDragged ? 1 : 0)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: TabFramesPreferenceKey.self,
+                    value: [
+                        tabID: proxy.frame(
+                            in: .named(RepositoryTopBar.coordinateSpaceName)
+                        )
+                    ]
+                )
+            }
+        }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .help(tab.repositoryURL?.path ?? "Open a repository")
@@ -3313,7 +3598,28 @@ private struct ChangesActionBar: View {
         // Tall enough to give the 30pt mode picker capsule clear air above
         // and below, matching Xcode's navigator-switcher bar.
         .frame(height: 46)
+        // With window-server dragging disabled (`isMovable = false`), give
+        // the empty areas of this bar back to window dragging.
+        .background(WindowDragHandle())
     }
+}
+
+/// Background view whose empty areas drag the window. Needed because
+/// AppKit-initiated window dragging is disabled (`NSWindow.isMovable` is
+/// false, see `WindowConfigurator`), so any region that should move the
+/// window must call `performDrag` explicitly.
+struct WindowDragHandle: NSViewRepresentable {
+    final class HandleView: NSView {
+        override func mouseDown(with event: NSEvent) {
+            window?.performDrag(with: event)
+        }
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        HandleView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 struct SpinningCodiconGlyph: View {
@@ -4386,74 +4692,21 @@ private final class GraphNestedFileHoverState: ObservableObject {
 
 private struct GraphPanel: View {
     @EnvironmentObject private var model: RepositoryModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let isOpeningRepository: Bool
     @State private var revealHeadRequest = 0
     @StateObject private var nestedFileHoverState = GraphNestedFileHoverState()
 
     var body: some View {
-        ScrollViewReader { proxy in
-            VStack(spacing: 0) {
-                GraphHeader {
-                    guard let headHash = model.headHash else { return }
-                    if model.ahead == 0 {
-                        revealHeadRequest &+= 1
-                    } else if let headRowID = model.graph.first(
-                        where: { $0.commit.hash == headHash }
-                    )?.id {
-                        if reduceMotion {
-                            proxy.scrollTo(headRowID, anchor: .center)
-                        } else {
-                            withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo(headRowID, anchor: .center)
-                            }
-                        }
-                    }
-                }
+        VStack(spacing: 0) {
+            GraphHeader {
+                guard model.headHash != nil else { return }
+                revealHeadRequest &+= 1
+            }
 
-                if isOpeningRepository || (model.repositoryURL == nil && model.isBusy) {
-                    GraphPanelLoadingContent()
-                } else if model.ahead == 0 {
-                    GraphHistoryTable(revealHeadRequest: revealHeadRequest)
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                        if model.graph.isEmpty {
-                            Text("No commits yet")
-                                .font(AppType.rowDetail)
-                                .foregroundStyle(AppTheme.muted)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 31)
-                                .padding(.vertical, 10)
-                        }
-
-                        ForEach(model.graph) { row in
-                            if row.kind == .head && model.ahead > 0 {
-                                GraphOutgoingRow(row: row)
-                            }
-
-                            GraphCommitRow(row: row)
-                                .id(row.id)
-                        }
-
-                        if model.canLoadMoreGraph {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(AppTheme.secondary)
-                                .opacity(model.isLoadingMoreGraph ? 1 : 0)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 28)
-                                .id("graph-load-more-\(model.graph.count)")
-                                .onAppear {
-                                    Task { await model.loadMoreGraph() }
-                                }
-                                .accessibilityLabel("Loading more commits")
-                                .accessibilityHidden(!model.isLoadingMoreGraph)
-                        }
-                        }
-                    }
-                    .scrollIndicators(.hidden)
-                }
+            if isOpeningRepository || (model.repositoryURL == nil && model.isBusy) {
+                GraphPanelLoadingContent()
+            } else {
+                GraphHistoryTable(revealHeadRequest: revealHeadRequest)
             }
         }
         .environmentObject(nestedFileHoverState)
@@ -4531,6 +4784,10 @@ private struct GraphHistoryTable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSScrollView {
         let table = NSTableView()
+        // The automatic style resolves to the inset style and pads rows by
+        // ~16pt per side, shrinking the commit-message column. Plain keeps
+        // the full panel width for rows.
+        table.style = .plain
         table.headerView = nil
         table.backgroundColor = .clear
         table.selectionHighlightStyle = .none
@@ -5291,167 +5548,6 @@ private struct GraphHeader: View {
     }
 }
 
-private struct GraphOutgoingRow: View {
-    @EnvironmentObject private var model: RepositoryModel
-    let row: GraphRow
-    @State private var hovering = false
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Button {
-                model.toggleOutgoingExpansion()
-            } label: {
-                HStack(spacing: 8) {
-                    GraphOutgoingTopology(row: row)
-
-                    Text("Outgoing Changes")
-                        .font(AppType.row)
-                        .lineLimit(1)
-
-                    Text(model.branch)
-                        .font(AppType.rowDetail)
-                        .foregroundStyle(AppTheme.secondary)
-                        .lineLimit(1)
-
-                    Spacer()
-
-                    Text("\(model.ahead)")
-                        .font(AppType.captionEmphasis)
-                        .monospacedDigit()
-                        .foregroundStyle(AppTheme.secondary)
-                }
-                .padding(.leading, 9)
-                .padding(.trailing, 22)
-                .frame(height: 31)
-                .contentShape(Rectangle())
-                .background(hovering ? AppTheme.hover : .clear)
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering = $0 }
-            .help(model.isOutgoingExpanded ? "Collapse outgoing changes" : "Show outgoing changes")
-            .accessibilityLabel("Outgoing Changes on \(model.branch)")
-            .accessibilityValue(model.isOutgoingExpanded ? "Expanded" : "Collapsed")
-
-            if model.isOutgoingExpanded {
-                if model.isLoadingOutgoingFiles {
-                    GraphOutgoingLoadingRow(row: row)
-                } else if model.outgoingFiles.isEmpty {
-                    GraphOutgoingEmptyRow(row: row)
-                } else {
-                    ForEach(model.outgoingFiles) { file in
-                        GraphOutgoingFileRow(row: row, file: file)
-                    }
-                }
-            }
-        }
-    }
-}
-
-private struct GraphOutgoingLoadingRow: View {
-    let row: GraphRow
-
-    var body: some View {
-        HStack(spacing: 8) {
-            GraphExpansionTopology(row: row)
-            Color.clear.frame(width: 10)
-            ProgressView().controlSize(.small)
-            Text("Loading outgoing files…")
-                .font(AppType.nestedRowDetail)
-                .foregroundStyle(AppTheme.secondary)
-            Spacer()
-        }
-        .padding(.leading, 9)
-        .padding(.trailing, 18)
-        .frame(height: 28)
-    }
-}
-
-private struct GraphOutgoingEmptyRow: View {
-    let row: GraphRow
-
-    var body: some View {
-        HStack(spacing: 8) {
-            GraphExpansionTopology(row: row)
-            Color.clear.frame(width: 10)
-            Text("No outgoing file changes")
-                .font(AppType.nestedRowDetail)
-                .foregroundStyle(AppTheme.muted)
-            Spacer()
-        }
-        .padding(.leading, 9)
-        .padding(.trailing, 18)
-        .frame(height: 28)
-    }
-}
-
-private struct GraphOutgoingTopology: View {
-    let row: GraphRow
-
-    private let laneWidth: CGFloat = 11
-    private let rowHeight: CGFloat = 31
-
-    var body: some View {
-        Canvas(opaque: false, rendersAsynchronously: true) { context, _ in
-            let index = row.inputLanes.firstIndex(where: { $0.id == row.commit.hash })
-                ?? row.inputLanes.count
-            let x = laneWidth * CGFloat(index + 1)
-            let color = laneColor(at: index)
-
-            // This row is injected above the commit it belongs to, so every
-            // incoming lane must continue through it; the lane holding the
-            // dashed circle leaves a gap for the circle itself.
-            for (laneIndex, lane) in row.inputLanes.enumerated() {
-                let laneX = laneWidth * CGFloat(laneIndex + 1)
-                var path = Path()
-                path.move(to: CGPoint(x: laneX, y: 0))
-                if laneIndex == index {
-                    path.addLine(to: CGPoint(x: laneX, y: (rowHeight / 2) - 7))
-                } else {
-                    path.addLine(to: CGPoint(x: laneX, y: rowHeight))
-                }
-                context.stroke(
-                    path,
-                    with: .color(lane.color.swiftUIColor),
-                    lineWidth: 1.2
-                )
-            }
-
-            var line = Path()
-            line.move(to: CGPoint(x: x, y: (rowHeight / 2) + 7))
-            line.addLine(to: CGPoint(x: x, y: rowHeight))
-            context.stroke(line, with: .color(color), lineWidth: 1.2)
-
-            let circle = Path(ellipseIn: CGRect(
-                x: x - 7,
-                y: (rowHeight / 2) - 7,
-                width: 14,
-                height: 14
-            ))
-            context.stroke(
-                circle,
-                with: .color(color),
-                style: StrokeStyle(lineWidth: 1.5, dash: [3, 2])
-            )
-        }
-        .frame(width: graphWidth, height: rowHeight)
-        .accessibilityHidden(true)
-    }
-
-    private var graphWidth: CGFloat {
-        laneWidth * CGFloat(max(row.inputLanes.count, row.outputLanes.count, 1) + 1)
-    }
-
-    private func laneColor(at index: Int) -> Color {
-        if index < row.outputLanes.count {
-            return row.outputLanes[index].color.swiftUIColor
-        }
-        if index < row.inputLanes.count {
-            return row.inputLanes[index].color.swiftUIColor
-        }
-        return AppTheme.graphBlue
-    }
-}
-
 private struct GraphCommitRow: View {
     @EnvironmentObject private var model: RepositoryModel
     let row: GraphRow
@@ -5464,19 +5560,23 @@ private struct GraphCommitRow: View {
     }
 
     var body: some View {
-        let presentedReferences = displayReferences
-        let presentedReferenceIDs = Set(presentedReferences.map(\.id))
-        let visibleReferences = Array(presentedReferences.prefix(2))
-        let hiddenReferences = presentedReferences.dropFirst(visibleReferences.count)
+        let presentedItems = GraphReferencePresentation.displayItems(
+            row.commit.references,
+            upstreamReferenceID: model.upstreamReference?.id
+        )
+        let presentedReferenceIDs = Set(presentedItems.flatMap {
+            [$0.reference.id] + $0.syncedRemotes.map(\.id)
+        })
+        let visibleItems = Array(presentedItems.prefix(2))
+        let hiddenReferences = presentedItems
+            .dropFirst(visibleItems.count)
+            .map(\.reference)
         VStack(spacing: 0) {
             Button {
                 model.toggleCommitExpansion(row.commit)
             } label: {
                 HStack(spacing: 8) {
-                    GraphTopology(
-                        row: row,
-                        connectIncoming: isHead && model.ahead > 0
-                    )
+                    GraphTopology(row: row)
 
                     Text(row.commit.displaySubject)
                         .font(isHead ? AppType.rowEmphasis : AppType.row)
@@ -5486,9 +5586,10 @@ private struct GraphCommitRow: View {
                         .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                         .layoutPriority(2)
 
-                    ForEach(visibleReferences) { reference in
+                    ForEach(visibleItems) { item in
                         BranchPill(
-                            reference: reference,
+                            reference: item.reference,
+                            syncedRemotes: item.syncedRemotes,
                             commitIsHead: isHead,
                             referenceIDsAtCommit: presentedReferenceIDs
                         )
@@ -5893,6 +5994,64 @@ private struct GraphCommitRow: View {
 }
 
 enum GraphReferencePresentation {
+    struct DisplayItem: Identifiable, Hashable {
+        let reference: GitReference
+        /// Remote branches on the same commit that track this local branch
+        /// (`origin/main` on `main`). Folded into the local pill so a synced
+        /// branch shows one badge and the commit message keeps its width.
+        let syncedRemotes: [GitReference]
+
+        var id: String { reference.id }
+    }
+
+    static func displayItems(
+        _ references: [GitReference],
+        upstreamReferenceID: String?
+    ) -> [DisplayItem] {
+        let ordered = displayReferences(
+            references,
+            upstreamReferenceID: upstreamReferenceID
+        )
+        let localNames = Set(
+            ordered.filter { $0.kind == .localBranch }.map(\.name)
+        )
+        var syncedRemotesByLocalName: [String: [GitReference]] = [:]
+        var items: [DisplayItem] = []
+
+        for reference in ordered where reference.kind == .remoteBranch {
+            guard let localName = trackedLocalName(of: reference),
+                  localNames.contains(localName) else { continue }
+            syncedRemotesByLocalName[localName, default: []].append(reference)
+        }
+
+        for reference in ordered {
+            if reference.kind == .remoteBranch,
+               let localName = trackedLocalName(of: reference),
+               localNames.contains(localName) {
+                continue
+            }
+            items.append(DisplayItem(
+                reference: reference,
+                syncedRemotes: reference.kind == .localBranch
+                    ? syncedRemotesByLocalName[reference.name] ?? []
+                    : []
+            ))
+        }
+        return items
+    }
+
+    /// `origin/main` tracks `main`: the branch name after the remote's own
+    /// name. Nil when the name has no remote prefix to strip.
+    private static func trackedLocalName(of reference: GitReference) -> String? {
+        let components = reference.name.split(
+            separator: "/",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        guard components.count == 2, !components[1].isEmpty else { return nil }
+        return String(components[1])
+    }
+
     static func displayReferences(
         _ references: [GitReference],
         upstreamReferenceID: String?
@@ -5984,24 +6143,6 @@ private struct GraphCommitEmptyRow: View {
     }
 }
 
-private struct GraphOutgoingFileRow: View {
-    @EnvironmentObject private var model: RepositoryModel
-    let row: GraphRow
-    let file: CommitFileChange
-
-    var body: some View {
-        GraphNestedFileRow(
-            row: row,
-            file: file,
-            hoverID: "outgoing:\(file.id)",
-            isSelected: model.selectedCommit == nil
-                && model.selectedCommitFile?.id == file.id
-        ) {
-            model.activateOutgoingFile(file)
-        }
-    }
-}
-
 private struct GraphCommitFileRow: View {
     @EnvironmentObject private var model: RepositoryModel
     let row: GraphRow
@@ -6021,8 +6162,7 @@ private struct GraphCommitFileRow: View {
     }
 }
 
-/// Shared layout for the file rows nested under an expanded commit or the
-/// outgoing-changes row, so both render identically.
+/// Shared layout for the file rows nested under an expanded commit.
 private struct GraphNestedFileRow: View {
     @EnvironmentObject private var model: RepositoryModel
     @EnvironmentObject private var hoverState: GraphNestedFileHoverState
@@ -6433,7 +6573,6 @@ enum GraphTopologyMetrics {
 
 private struct GraphTopology: View {
     let row: GraphRow
-    let connectIncoming: Bool
 
     private let laneWidth: CGFloat = 11
     private let rowHeight: CGFloat = 32
@@ -6536,11 +6675,6 @@ private struct GraphTopology: View {
                 color: row.inputLanes[inputIndex].color.swiftUIColor,
                 context: &context
             )
-        } else if connectIncoming {
-            var incoming = Path()
-            incoming.move(to: CGPoint(x: circleX, y: 0))
-            incoming.addLine(to: CGPoint(x: circleX, y: middleY))
-            stroke(incoming, color: circleColor, context: &context)
         }
 
         if !row.commit.parentHashes.isEmpty {
@@ -6952,6 +7086,7 @@ private struct ReferenceContextMenuItems: View {
 private struct BranchPill: View {
     @EnvironmentObject private var model: RepositoryModel
     let reference: GitReference
+    var syncedRemotes: [GitReference] = []
     let commitIsHead: Bool
     let referenceIDsAtCommit: Set<String>
 
@@ -6967,6 +7102,10 @@ private struct BranchPill: View {
                 .font(.system(size: 13, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if !syncedRemotes.isEmpty {
+                Image(systemName: "cloud")
+                    .font(.system(size: 11, weight: .medium))
+            }
         }
         .foregroundStyle(foregroundColor)
         .padding(.horizontal, 8)
@@ -6983,6 +7122,20 @@ private struct BranchPill: View {
                 commitIsHead: commitIsHead,
                 referenceIDsAtCommit: referenceIDsAtCommit
             )
+
+            if !syncedRemotes.isEmpty {
+                Divider()
+
+                ForEach(syncedRemotes) { remote in
+                    Menu(remote.name) {
+                        ReferenceContextMenuItems(
+                            reference: remote,
+                            commitIsHead: commitIsHead,
+                            referenceIDsAtCommit: referenceIDsAtCommit
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -7022,9 +7175,12 @@ private struct BranchPill: View {
     private var helpText: String {
         switch reference.kind {
         case .localBranch:
-            return reference.isHead
+            let base = reference.isHead
                 ? "Current local branch: \(reference.name)"
                 : "Local branch: \(reference.name)"
+            guard !syncedRemotes.isEmpty else { return base }
+            let names = syncedRemotes.map(\.name).joined(separator: ", ")
+            return "\(base) — in sync with \(names)"
         case .remoteBranch:
             return "Remote branch: \(reference.name)"
         case .tag:

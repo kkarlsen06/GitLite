@@ -392,6 +392,12 @@ private struct WindowConfigurator: NSViewRepresentable {
             // from being interpreted as window drags. The tab row occupies the
             // titlebar region and provides window dragging via WindowDragArea.
             window.isMovableByWindowBackground = false
+            // Disable AppKit/window-server-initiated dragging for the titlebar
+            // region entirely: it runs server-side on modern macOS and would
+            // move the window during ⌘-drag tab reordering even though the
+            // event monitor consumes the mouse events. All window dragging
+            // goes through WindowDragArea's explicit performDrag instead.
+            window.isMovable = false
             window.backgroundColor = AppTheme.canvasNSColor
             window.standardWindowButton(.closeButton)?.isHidden = false
             window.standardWindowButton(.miniaturizeButton)?.isHidden = false

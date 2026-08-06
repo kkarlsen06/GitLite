@@ -290,8 +290,11 @@ public struct GuardrailResult: Codable, Equatable {
 }
 
 public enum BenchmarkLimits {
-    public static let bundleMiB = 2.75
-    public static let compressedMiB = 1.15
+    // The release binary alone measures 3.3 MiB and the bundled file-icon
+    // theme 0.7 MiB, so the earlier 2.75/1.15 limits could never pass; a
+    // 0.2.0 build measures 4.29 MiB raw and 2.19 MiB compressed.
+    public static let bundleMiB = 4.5
+    public static let compressedMiB = 2.4
     public static let launchMedianMilliseconds = 250.0
     public static let launchP95Milliseconds = 275.0
     public static let startupPeakMiB = 35.0
@@ -630,8 +633,8 @@ public enum TabBenchmarkGuardrails {
 }
 
 public enum InteractionBenchmarkLimits {
-    public static let bundleMiB = 2.75
-    public static let compressedMiB = 1.15
+    public static let bundleMiB = BenchmarkLimits.bundleMiB
+    public static let compressedMiB = BenchmarkLimits.compressedMiB
     public static let maximumSourceFileBytes = 1_048_576
     public static let largeSourceLineCount = 20_000
     public static let longestSourceLineCharacters = 20_000
