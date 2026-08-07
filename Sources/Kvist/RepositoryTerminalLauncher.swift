@@ -5,26 +5,50 @@ enum RepositoryTerminalLauncher {
     static func open(
         repositoryURL: URL,
         sshRepository: SSHRepository?,
-        workspace: NSWorkspace = .shared
+        bundleIdentifier: String = TerminalPreferences.selectedBundleIdentifier(),
+        workspace: NSWorkspace = .shared,
+        onFailure: ((Error) -> Void)? = nil
     ) throws {
         guard let terminalURL = workspace.urlForApplication(
-            withBundleIdentifier: "com.apple.Terminal"
+            withBundleIdentifier: bundleIdentifier
         ) else {
-            throw RepositoryTerminalError.terminalNotFound
+            throw RepositoryTerminalError.terminalNotFound(
+                name: TerminalPreferences.displayName(
+                    forBundleIdentifier: bundleIdentifier,
+                    applicationURL: nil
+                )
+            )
         }
 
         let targetURL: URL
+        let applicationURL: URL
         if let sshRepository {
+            // Terminals that cannot run a .command file accept the open without
+            // ever starting the session, so hand SSH to a shell-script runner.
             targetURL = try makeSSHCommandFile(for: sshRepository)
+            applicationURL = TerminalPreferences.shellScriptApplicationURL(
+                bundleIdentifier: bundleIdentifier,
+                applicationURL: terminalURL,
+                defaultHandlerURL: workspace.urlForApplication(toOpen: targetURL)
+            )
         } else {
             targetURL = repositoryURL
+            applicationURL = terminalURL
         }
+        let terminalName = TerminalPreferences.displayName(forApplicationAt: applicationURL)
         workspace.open(
             [targetURL],
-            withApplicationAt: terminalURL,
-            configuration: NSWorkspace.OpenConfiguration(),
-            completionHandler: nil
-        )
+            withApplicationAt: applicationURL,
+            configuration: NSWorkspace.OpenConfiguration()
+        ) { _, error in
+            guard let error else { return }
+            onFailure?(
+                RepositoryTerminalError.launchFailed(
+                    name: terminalName,
+                    reason: error.localizedDescription
+                )
+            )
+        }
     }
 
     static func sshArguments(for repository: SSHRepository) -> [String] {
@@ -77,15 +101,21 @@ enum RepositoryTerminalLauncher {
 }
 
 enum RepositoryTerminalError: LocalizedError {
-    case terminalNotFound
+    case terminalNotFound(name: String)
     case commandFileCreationFailed
+    case launchFailed(name: String, reason: String)
+    case unreadableApplication
 
     var errorDescription: String? {
         switch self {
-        case .terminalNotFound:
-            "Terminal could not be found."
+        case let .terminalNotFound(name):
+            "\(name) could not be found. Choose another terminal app in Settings."
         case .commandFileCreationFailed:
             "Kvist could not prepare the SSH terminal session."
+        case let .launchFailed(name, reason):
+            "\(name) could not open the repository. \(reason)"
+        case .unreadableApplication:
+            "Kvist could not read that app's identifier. Choose an application bundle."
         }
     }
 }

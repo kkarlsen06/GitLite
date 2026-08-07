@@ -1536,6 +1536,10 @@ private struct GeneralPreferencesPane: View {
     private var allowsCodexProcessing = false
     @AppStorage(PrivacyPreferences.claudeProcessingConsentKey)
     private var allowsClaudeProcessing = false
+    @AppStorage(TerminalPreferences.bundleIdentifierKey)
+    private var terminalBundleIdentifier = TerminalPreferences.defaultBundleIdentifier
+    @State private var terminalApplications: [TerminalApplication] = []
+    @State private var terminalError: String?
     @State private var showsAdvancedAISettings = false
     @State private var availableModels: [AICommitMessageModel] = []
     @State private var isLoadingModels = false
@@ -1581,6 +1585,36 @@ private struct GeneralPreferencesPane: View {
                 Text("Open tabs, the selected tab, Files mode, expanded folders, commit text, and unsaved editor drafts are recovered.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            Section("Terminal") {
+                LabeledContent("Open repositories in") {
+                    Menu {
+                        ForEach(terminalApplications) { application in
+                            Toggle(isOn: terminalSelection(for: application)) {
+                                terminalLabel(for: application)
+                            }
+                        }
+
+                        Divider()
+
+                        Button("Other…") {
+                            chooseTerminalApplication()
+                        }
+                    } label: {
+                        if let selected = selectedTerminalApplication {
+                            terminalLabel(for: selected)
+                        } else {
+                            Text(terminalBundleIdentifier)
+                        }
+                    }
+                    .fixedSize()
+                    .accessibilityLabel("Terminal app")
+                }
+
+                Text(terminalError ?? "The terminal button in the repository toolbar opens the working copy here. SSH sessions need a terminal that runs shell scripts, so they fall back to your default app for .command files.")
+                    .font(.caption)
+                    .foregroundStyle(terminalError == nil ? Color.secondary : Color.orange)
             }
 
             Section("Commits") {
@@ -1714,8 +1748,60 @@ private struct GeneralPreferencesPane: View {
             migrateLegacyCodexCommandIfNeeded()
             await refreshModels()
         }
+        .task {
+            refreshTerminalApplications()
+        }
         .onChange(of: codexModel) {
             normalizeCodexReasoningEffort()
+        }
+    }
+
+    private var selectedTerminalApplication: TerminalApplication? {
+        terminalApplications.first { $0.bundleIdentifier == terminalBundleIdentifier }
+    }
+
+    private func terminalSelection(for application: TerminalApplication) -> Binding<Bool> {
+        Binding(
+            get: { terminalBundleIdentifier == application.bundleIdentifier },
+            set: { isSelected in
+                guard isSelected else { return }
+                terminalError = nil
+                terminalBundleIdentifier = application.bundleIdentifier
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func terminalLabel(for application: TerminalApplication) -> some View {
+        if let icon = application.icon {
+            Label {
+                Text(application.menuTitle)
+            } icon: {
+                Image(nsImage: icon)
+            }
+        } else {
+            Label(application.menuTitle, systemImage: "questionmark.app.dashed")
+        }
+    }
+
+    @MainActor
+    private func refreshTerminalApplications() {
+        terminalApplications = TerminalPreferences.availableApplications(
+            selectedBundleIdentifier: terminalBundleIdentifier
+        )
+    }
+
+    @MainActor
+    private func chooseTerminalApplication() {
+        do {
+            guard let application = try TerminalPreferences.chooseApplication() else {
+                return
+            }
+            terminalError = nil
+            terminalBundleIdentifier = application.bundleIdentifier
+            refreshTerminalApplications()
+        } catch {
+            terminalError = error.localizedDescription
         }
     }
 

@@ -2199,7 +2199,11 @@ struct RepositoryTerminalButton: View {
             try RepositoryTerminalLauncher.open(
                 repositoryURL: repositoryURL,
                 sshRepository: model.sshRepository
-            )
+            ) { error in
+                Task { @MainActor in
+                    model.errorMessage = error.localizedDescription
+                }
+            }
         } catch {
             model.errorMessage = error.localizedDescription
         }
