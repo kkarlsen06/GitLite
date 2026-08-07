@@ -1512,12 +1512,84 @@ struct PreferencesView: View {
                 .tabItem { Label("Privacy & Legal", systemImage: "hand.raised") }
         }
         .frame(width: 700, height: 520)
+        .background(AppTheme.canvas)
         .preferredColorScheme(themes.preferredColorScheme)
         .tint(AppTheme.actionBlue)
     }
 }
 
+/// Themed replacement for the system grouped `Form` used in the settings
+/// panes. The system form draws its section cards with fixed window-background
+/// materials, so panes that should follow the selected theme build their
+/// sections from these instead.
+private struct PreferencesSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AppTheme.primary)
+                .padding(.horizontal, 2)
+            VStack(alignment: .leading, spacing: 0) {
+                content
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(AppTheme.raisedFill)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(AppTheme.edge, lineWidth: 1)
+            }
+        }
+    }
+}
+
+private struct PreferencesRow<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+    }
+}
+
+private struct PreferencesRowDivider: View {
+    var body: some View {
+        Divider()
+            .overlay(AppTheme.edge)
+            .padding(.leading, 14)
+    }
+}
+
+private struct PreferencesCaption: View {
+    let text: String
+    var isWarning = false
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(isWarning ? AppTheme.conflict : AppTheme.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
 private struct GeneralPreferencesPane: View {
+    /// Colors are read from the static `AppTheme`; observing the preferences
+    /// object re-renders the pane when the selected theme changes.
+    @EnvironmentObject private var themes: ThemePreferences
     @AppStorage("restoreWorkspaceOnLaunch") private var restoreWorkspaceOnLaunch = true
     @AppStorage("smartCommitPreference") private var smartCommitPreference = 0
     @AppStorage(AICommitMessagePreferences.providerKey)
@@ -1579,171 +1651,238 @@ private struct GeneralPreferencesPane: View {
     }
 
     var body: some View {
-        Form {
-            Section("Workspace") {
-                Toggle("Restore repositories and workspace state when Kvist opens", isOn: $restoreWorkspaceOnLaunch)
-                Text("Open tabs, the selected tab, Files mode, expanded folders, commit text, and unsaved editor drafts are recovered.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Terminal") {
-                LabeledContent("Open repositories in") {
-                    Menu {
-                        ForEach(terminalApplications) { application in
-                            Toggle(isOn: terminalSelection(for: application)) {
-                                terminalLabel(for: application)
-                            }
-                        }
-
-                        Divider()
-
-                        Button("Other…") {
-                            chooseTerminalApplication()
-                        }
-                    } label: {
-                        if let selected = selectedTerminalApplication {
-                            terminalLabel(for: selected)
-                        } else {
-                            Text(terminalBundleIdentifier)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                PreferencesSection("Workspace") {
+                    PreferencesRow {
+                        HStack {
+                            Text("Restore repositories and workspace state when Kvist opens")
+                            Spacer()
+                            Toggle(
+                                "Restore repositories and workspace state when Kvist opens",
+                                isOn: $restoreWorkspaceOnLaunch
+                            )
+                            .labelsHidden()
+                            .toggleStyle(.switch)
                         }
                     }
-                    .fixedSize()
-                    .accessibilityLabel("Terminal app")
-                }
-
-                Text(terminalError ?? "The terminal button in the repository toolbar opens the working copy here. SSH sessions need a terminal that runs shell scripts, so they fall back to your default app for .command files.")
-                    .font(.caption)
-                    .foregroundStyle(terminalError == nil ? Color.secondary : Color.orange)
-            }
-
-            Section("Commits") {
-                Picker("When nothing is staged", selection: $smartCommitPreference) {
-                    Text("Ask Each Time").tag(0)
-                    Text("Stage All Changes and Commit").tag(1)
-                    Text("Require Manual Staging").tag(2)
-                }
-                .pickerStyle(.menu)
-            }
-
-            Section("AI Commit Message") {
-                Picker("Agent", selection: $aiProviderRawValue) {
-                    ForEach(AICommitMessageProvider.allCases) { provider in
-                        Text(provider.displayName).tag(provider.rawValue)
+                    PreferencesRowDivider()
+                    PreferencesRow {
+                        PreferencesCaption(text: "Open tabs, the selected tab, Files mode, expanded folders, commit text, and unsaved editor drafts are recovered.")
                     }
                 }
-                .pickerStyle(.segmented)
 
-                LabeledContent("Model") {
-                    HStack(spacing: 6) {
-                        TextField("Model ID", text: selectedModel)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 230)
-
-                        Menu {
-                            ForEach(availableModels) { model in
-                                Button {
-                                    selectedModel.wrappedValue = model.id
-                                    normalizeCodexReasoningEffort()
-                                } label: {
-                                    if model.name == model.id {
-                                        Text(model.id)
-                                    } else {
-                                        Text("\(model.name) (\(model.id))")
+                PreferencesSection("Terminal") {
+                    PreferencesRow {
+                        HStack {
+                            Text("Open repositories in")
+                            Spacer()
+                            Menu {
+                                ForEach(terminalApplications) { application in
+                                    Toggle(isOn: terminalSelection(for: application)) {
+                                        terminalLabel(for: application)
                                     }
                                 }
-                            }
-                        } label: {
-                            Image(systemName: "chevron.down")
-                        }
-                        .menuStyle(.borderlessButton)
-                        .fixedSize()
-                        .disabled(availableModels.isEmpty)
-                        .help("Choose an available model")
 
-                        Button {
-                            Task { await refreshModels() }
-                        } label: {
-                            if isLoadingModels {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Image(systemName: "arrow.clockwise")
+                                Divider()
+
+                                Button("Other…") {
+                                    chooseTerminalApplication()
+                                }
+                            } label: {
+                                if let selected = selectedTerminalApplication {
+                                    terminalLabel(for: selected)
+                                } else {
+                                    Text(terminalBundleIdentifier)
+                                }
                             }
+                            .fixedSize()
+                            .accessibilityLabel("Terminal app")
                         }
-                        .buttonStyle(.borderless)
-                        .disabled(isLoadingModels)
-                        .help("Refresh available models")
+                    }
+                    PreferencesRowDivider()
+                    PreferencesRow {
+                        PreferencesCaption(
+                            text: terminalError ?? "The terminal button in the repository toolbar opens the working copy here. SSH sessions need a terminal that runs shell scripts, so they fall back to your default app for .command files.",
+                            isWarning: terminalError != nil
+                        )
                     }
                 }
 
-                if provider == .codex {
-                    Picker(
-                        "Reasoning effort",
-                        selection: $codexReasoningEffortRawValue
-                    ) {
-                        ForEach(availableCodexReasoningEfforts) { effort in
-                            Text(effort.displayName).tag(effort.rawValue)
-                        }
-                    }
-                    .pickerStyle(.menu)
-
-                    if !codexCommandTemplate.contains("{reasoning-effort}") {
-                        Text("The custom command does not use the selected reasoning effort.")
-                            .font(.caption)
-                            .foregroundStyle(Color.orange)
-                    }
-                }
-
-                Text(modelLoadError ?? provider.modelSourceDescription)
-                    .font(.caption)
-                    .foregroundStyle(
-                        modelLoadError == nil ? Color.secondary : Color.orange
-                    )
-
-                Toggle(
-                    "Allow \(provider.displayName) to process staged changes",
-                    isOn: allowsProcessing
-                )
-                Text("Kvist runs the installed \(provider.displayName) CLI using your account. It may send the staged diff, repository path, and your instructions to \(provider.serviceName). Unstaged and untracked changes are excluded by the prompt.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                DisclosureGroup(
-                    "Advanced",
-                    isExpanded: $showsAdvancedAISettings
-                ) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Command template")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        TextField("Terminal command", text: selectedCommandTemplate)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.caption, design: .monospaced))
-                            .accessibilityLabel("AI commit message command template")
-
+                PreferencesSection("Commits") {
+                    PreferencesRow {
                         HStack {
-                            Button("Reset to \(provider.displayName) Default") {
-                                selectedCommandTemplate.wrappedValue =
-                                    provider.defaultCommandTemplate
-                            }
+                            Text("When nothing is staged")
                             Spacer()
-                            Text("Prompt: standard input")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Picker("When nothing is staged", selection: $smartCommitPreference) {
+                                Text("Ask Each Time").tag(0)
+                                Text("Stage All Changes and Commit").tag(1)
+                                Text("Require Manual Staging").tag(2)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .fixedSize()
+                        }
+                    }
+                }
+
+                PreferencesSection("AI Commit Message") {
+                    PreferencesRow {
+                        HStack {
+                            Text("Agent")
+                            Spacer()
+                            Picker("Agent", selection: $aiProviderRawValue) {
+                                ForEach(AICommitMessageProvider.allCases) { provider in
+                                    Text(provider.displayName).tag(provider.rawValue)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .fixedSize()
+                        }
+                    }
+                    PreferencesRowDivider()
+                    PreferencesRow {
+                        HStack {
+                            Text("Model")
+                            Spacer()
+                            HStack(spacing: 6) {
+                                TextField("Model ID", text: selectedModel)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 230)
+
+                                Menu {
+                                    ForEach(availableModels) { model in
+                                        Button {
+                                            selectedModel.wrappedValue = model.id
+                                            normalizeCodexReasoningEffort()
+                                        } label: {
+                                            if model.name == model.id {
+                                                Text(model.id)
+                                            } else {
+                                                Text("\(model.name) (\(model.id))")
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    Image(systemName: "chevron.down")
+                                }
+                                .menuStyle(.borderlessButton)
+                                .fixedSize()
+                                .disabled(availableModels.isEmpty)
+                                .help("Choose an available model")
+
+                                Button {
+                                    Task { await refreshModels() }
+                                } label: {
+                                    if isLoadingModels {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else {
+                                        Image(systemName: "arrow.clockwise")
+                                    }
+                                }
+                                .buttonStyle(.borderless)
+                                .disabled(isLoadingModels)
+                                .help("Refresh available models")
+                            }
+                        }
+                    }
+
+                    if provider == .codex {
+                        PreferencesRowDivider()
+                        PreferencesRow {
+                            HStack {
+                                Text("Reasoning effort")
+                                Spacer()
+                                Picker(
+                                    "Reasoning effort",
+                                    selection: $codexReasoningEffortRawValue
+                                ) {
+                                    ForEach(availableCodexReasoningEfforts) { effort in
+                                        Text(effort.displayName).tag(effort.rawValue)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                                .fixedSize()
+                            }
                         }
 
-                        Text("Kvist runs this command through /bin/zsh -lc in the repository. It shell-quotes and expands {executable}, {model}, {repository}, {schema}, {schema-json}, and {output}; Codex also expands {reasoning-effort}. Editing the template can run arbitrary shell commands with your user permissions.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                        if !codexCommandTemplate.contains("{reasoning-effort}") {
+                            PreferencesRow {
+                                PreferencesCaption(
+                                    text: "The custom command does not use the selected reasoning effort.",
+                                    isWarning: true
+                                )
+                            }
+                        }
                     }
-                    .padding(.top, 4)
+
+                    PreferencesRowDivider()
+                    PreferencesRow {
+                        PreferencesCaption(
+                            text: modelLoadError ?? provider.modelSourceDescription,
+                            isWarning: modelLoadError != nil
+                        )
+                    }
+                    PreferencesRowDivider()
+                    PreferencesRow {
+                        HStack {
+                            Text("Allow \(provider.displayName) to process staged changes")
+                            Spacer()
+                            Toggle(
+                                "Allow \(provider.displayName) to process staged changes",
+                                isOn: allowsProcessing
+                            )
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                        }
+                    }
+                    PreferencesRow {
+                        PreferencesCaption(text: "Kvist runs the installed \(provider.displayName) CLI using your account. It may send the staged diff, repository path, and your instructions to \(provider.serviceName). Unstaged and untracked changes are excluded by the prompt.")
+                    }
+                    PreferencesRowDivider()
+                    PreferencesRow {
+                        DisclosureGroup(
+                            "Advanced",
+                            isExpanded: $showsAdvancedAISettings
+                        ) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Command template")
+                                    .font(.caption)
+                                    .foregroundStyle(AppTheme.secondary)
+                                TextField("Terminal command", text: selectedCommandTemplate)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .accessibilityLabel("AI commit message command template")
+
+                                HStack {
+                                    Button("Reset to \(provider.displayName) Default") {
+                                        selectedCommandTemplate.wrappedValue =
+                                            provider.defaultCommandTemplate
+                                    }
+                                    Spacer()
+                                    Text("Prompt: standard input")
+                                        .font(.caption)
+                                        .foregroundStyle(AppTheme.secondary)
+                                }
+
+                                Text("Kvist runs this command through /bin/zsh -lc in the repository. It shell-quotes and expands {executable}, {model}, {repository}, {schema}, {schema-json}, and {output}; Codex also expands {reasoning-effort}. Editing the template can run arbitrary shell commands with your user permissions.")
+                                    .font(.caption)
+                                    .foregroundStyle(AppTheme.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                            }
+                            .padding(.top, 4)
+                        }
+                    }
                 }
             }
+            .padding(20)
+            .foregroundStyle(AppTheme.primary)
         }
-        .formStyle(.grouped)
-        .padding(.top, 10)
+        .background(AppTheme.canvas)
         .task(id: aiProviderRawValue) {
             migrateLegacyCodexCommandIfNeeded()
             await refreshModels()
@@ -1851,36 +1990,58 @@ private struct GeneralPreferencesPane: View {
 }
 
 private struct LegalPreferencesPane: View {
+    /// Colors are read from the static `AppTheme`; observing the preferences
+    /// object re-renders the pane when the selected theme changes.
+    @EnvironmentObject private var themes: ThemePreferences
+
     var body: some View {
-        Form {
-            Section("Privacy") {
-                Text("Repository operations stay on this Mac unless you explicitly use AI commit-message generation or Open VSX theme discovery.")
-                Button("Open Privacy Notice") {
-                    openBundledDocument(named: "PRIVACY", fileExtension: "md")
-                }
-            }
-
-            Section("Licenses") {
-                Text("Kvist is MIT licensed. The built-in themes and Material Icon Theme are distributed under the open-source licenses included with the app.")
-                HStack {
-                    Button("Kvist License") {
-                        openBundledDocument(named: "LICENSE", fileExtension: "txt")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                PreferencesSection("Privacy") {
+                    PreferencesRow {
+                        Text("Repository operations stay on this Mac unless you explicitly use AI commit-message generation or Open VSX theme discovery.")
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    Button("Third-Party Notices") {
-                        openBundledDocument(
-                            named: "THIRD_PARTY_NOTICES",
-                            fileExtension: "txt"
-                        )
+                    PreferencesRowDivider()
+                    PreferencesRow {
+                        Button("Open Privacy Notice") {
+                            openBundledDocument(named: "PRIVACY", fileExtension: "md")
+                        }
                     }
                 }
-            }
 
-            Section("Trademarks") {
-                Text("Git and the Git logo are either registered trademarks or trademarks of Software Freedom Conservancy, Inc. Kvist is independent and is not affiliated with or endorsed by the Git Project or Software Freedom Conservancy.")
+                PreferencesSection("Licenses") {
+                    PreferencesRow {
+                        Text("Kvist is MIT licensed. The built-in themes and Material Icon Theme are distributed under the open-source licenses included with the app.")
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    PreferencesRowDivider()
+                    PreferencesRow {
+                        HStack {
+                            Button("Kvist License") {
+                                openBundledDocument(named: "LICENSE", fileExtension: "txt")
+                            }
+                            Button("Third-Party Notices") {
+                                openBundledDocument(
+                                    named: "THIRD_PARTY_NOTICES",
+                                    fileExtension: "txt"
+                                )
+                            }
+                        }
+                    }
+                }
+
+                PreferencesSection("Trademarks") {
+                    PreferencesRow {
+                        Text("Git and the Git logo are either registered trademarks or trademarks of Software Freedom Conservancy, Inc. Kvist is independent and is not affiliated with or endorsed by the Git Project or Software Freedom Conservancy.")
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
+            .padding(20)
+            .foregroundStyle(AppTheme.primary)
         }
-        .formStyle(.grouped)
-        .padding(.top, 10)
+        .background(AppTheme.canvas)
     }
 
     private func openBundledDocument(named name: String, fileExtension: String) {
@@ -2263,7 +2424,7 @@ private struct IconPackRow: View {
                 Text(name).lineLimit(1)
                 Text(detail)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppTheme.secondary)
                     .lineLimit(1)
             }
         }
@@ -2285,7 +2446,7 @@ private struct ThemeLibraryRow: View {
                 Text(name).lineLimit(1)
                 Text(detail)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppTheme.secondary)
                     .lineLimit(1)
             }
         }
