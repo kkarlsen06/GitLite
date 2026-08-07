@@ -439,14 +439,9 @@ struct SSHRepository: Codable, Equatable, Sendable {
     let path: String
 
     init(host: String, path: String) throws {
-        let host = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = try Self.validatedHost(host)
         let path = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        let allowedHostCharacters = CharacterSet.alphanumerics.union(
-            CharacterSet(charactersIn: "@._-")
-        )
-        guard !host.isEmpty,
-              host.unicodeScalars.allSatisfy(allowedHostCharacters.contains),
-              path.hasPrefix("/") else {
+        guard path.hasPrefix("/") else {
             throw GitCommandError(
                 command: "ssh",
                 output: "Enter an SSH host such as user@example.com and an absolute repository path."
@@ -454,6 +449,21 @@ struct SSHRepository: Codable, Equatable, Sendable {
         }
         self.host = host
         self.path = path
+    }
+
+    static func validatedHost(_ host: String) throws -> String {
+        let host = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowedHostCharacters = CharacterSet.alphanumerics.union(
+            CharacterSet(charactersIn: "@._-")
+        )
+        guard !host.isEmpty,
+              host.unicodeScalars.allSatisfy(allowedHostCharacters.contains) else {
+            throw GitCommandError(
+                command: "ssh",
+                output: "Enter an SSH host such as user@example.com and an absolute repository path."
+            )
+        }
+        return host
     }
 
     var displayName: String {
@@ -3499,12 +3509,16 @@ struct GitClient: Sendable {
 
     private func runSSH(_ command: String) throws -> Data {
         guard let sshRepository else { return Data() }
+        return try Self.runSSH(host: sshRepository.host, command: command)
+    }
+
+    static func runSSH(host: String, command: String) throws -> Data {
         let process = Process()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
         process.executableURL = SSHConnection.executableURL
         process.arguments = SSHConnection.arguments(
-            host: sshRepository.host,
+            host: host,
             command: command
         )
         process.environment = Self.commandEnvironment

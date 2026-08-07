@@ -2440,10 +2440,16 @@ private struct InitializeRepositoryView: View {
     }
 }
 
+private struct SSHBrowserSession: Identifiable {
+    let id = UUID()
+    let host: String
+}
+
 private struct WelcomeView: View {
     @EnvironmentObject private var model: RepositoryModel
     @EnvironmentObject private var tabsModel: WorkspaceTabsModel
     @State private var isDropTargeted = false
+    @State private var sshBrowserSession: SSHBrowserSession?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2533,10 +2539,21 @@ private struct WelcomeView: View {
             }
             return true
         }
+        .sheet(item: $sshBrowserSession) { session in
+            SSHRepositoryBrowserView(host: session.host) { path in
+                Task {
+                    await model.openSSHRepository(host: session.host, path: path)
+                }
+            }
+        }
     }
 
     private func openSSHRepository() {
         guard let location = GitPrompt.sshRepository() else { return }
+        if location.path.isEmpty {
+            sshBrowserSession = SSHBrowserSession(host: location.host)
+            return
+        }
         Task {
             await model.openSSHRepository(host: location.host, path: location.path)
         }
@@ -6431,14 +6448,18 @@ private enum GitPrompt {
     static func sshRepository() -> (host: String, path: String)? {
         let result = AppDialog.run(
             title: "Open Repository over SSH",
-            message: "Kvist uses your existing SSH config and keys to run Git on the remote machine.",
+            message: "Kvist uses your existing SSH config and keys to run Git on the remote machine. Leave the path empty to browse the remote machine's folders.",
             fields: [
                 AppDialogField(label: "SSH host", placeholder: "user@example.com"),
-                AppDialogField(label: "Repository path", placeholder: "/srv/repository")
+                AppDialogField(
+                    label: "Repository path",
+                    placeholder: "Optional — leave empty to browse",
+                    isRequired: false
+                )
             ],
             actions: [
                 AppDialogAction(title: "Cancel", role: .cancel),
-                AppDialogAction(title: "Open Repository", role: .primary)
+                AppDialogAction(title: "Connect", role: .primary)
             ]
         )
         guard result.actionIndex == 1, result.values.count == 2 else { return nil }
