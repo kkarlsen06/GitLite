@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/dist/Kvist.app"
 ARCHIVE="$ROOT/dist/Kvist.zip"
+DMG="$ROOT/dist/Kvist.dmg"
 NOTARY_PROFILE="${KVIST_NOTARY_PROFILE:-kvist-notary}"
 
 if [[ -n "${KVIST_SIGNING_IDENTITY:-}" ]]; then
@@ -41,4 +42,16 @@ spctl --assess --type execute --verbose=2 "$APP"
 rm -f "$ARCHIVE"
 ditto -c -k --keepParent "$APP" "$ARCHIVE"
 
+KVIST_SIGNING_IDENTITY="$SIGNING_IDENTITY" \
+  "$ROOT/Scripts/dmg.sh" "$APP" "$DMG"
+
+xcrun notarytool submit \
+  "$DMG" \
+  --keychain-profile "$NOTARY_PROFILE" \
+  --wait
+
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
+
 echo "$ARCHIVE"
+echo "$DMG"
