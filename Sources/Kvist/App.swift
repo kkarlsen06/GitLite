@@ -324,6 +324,12 @@ private final class KvistAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard let model = tabsModel?.activeModel,
+              model.sshRepository != nil else { return }
+        Task { await model.refresh() }
+    }
+
     func applicationShouldTerminate(
         _ sender: NSApplication
     ) -> NSApplication.TerminateReply {
