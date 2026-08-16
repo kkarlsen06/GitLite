@@ -7073,7 +7073,8 @@ private struct ReferenceContextMenuItems: View {
     }
 
     private var rebaseTargets: [GitReference] {
-        guard reference.kind == .localBranch else { return [] }
+        guard reference.kind == .localBranch,
+              !reference.isRemoteDefaultBranch(in: model.references) else { return [] }
         return model.references
             .filter {
                 ($0.kind == .localBranch || $0.kind == .remoteBranch)

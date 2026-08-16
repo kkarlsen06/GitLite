@@ -132,6 +132,21 @@ struct GitReference: Identifiable, Hashable, Sendable {
     let name: String
     let kind: GitReferenceKind
     let isHead: Bool
+    let symbolicTarget: String?
+
+    init(
+        id: String,
+        name: String,
+        kind: GitReferenceKind,
+        isHead: Bool,
+        symbolicTarget: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.isHead = isHead
+        self.symbolicTarget = symbolicTarget
+    }
 
     var remoteBranchComponents: (remote: String, branch: String)? {
         guard kind == .remoteBranch else { return nil }
@@ -140,6 +155,16 @@ struct GitReference: Identifiable, Hashable, Sendable {
               !components[0].isEmpty,
               !components[1].isEmpty else { return nil }
         return (remote: components[0], branch: components[1])
+    }
+
+    func isRemoteDefaultBranch(in references: [GitReference]) -> Bool {
+        guard kind == .localBranch else { return false }
+        return references.contains { reference in
+            guard let remoteBranch = reference.remoteBranchComponents,
+                  remoteBranch.branch == "HEAD" else { return false }
+            return reference.symbolicTarget
+                == "refs/remotes/\(remoteBranch.remote)/\(name)"
+        }
     }
 }
 
@@ -2355,14 +2380,14 @@ struct GitClient: Sendable {
             : ["refs/heads", "refs/remotes", "refs/tags", "refs/stash"]
         let arguments = [
             "for-each-ref",
-            "--format=%(refname)%09%(HEAD)%09%(upstream)%09%(objectname)%09%(*objectname)"
+            "--format=%(refname)%09%(HEAD)%09%(upstream)%09%(objectname)%09%(*objectname)%09%(symref)"
         ] + namespaces
         return parseReferenceSnapshot(try run(arguments))
     }
 
     private static let standardReferenceArguments = [
         "for-each-ref",
-        "--format=%(refname)%09%(HEAD)%09%(upstream)%09%(objectname)%09%(*objectname)",
+        "--format=%(refname)%09%(HEAD)%09%(upstream)%09%(objectname)%09%(*objectname)%09%(symref)",
         "refs/heads",
         "refs/remotes",
         "refs/tags",
@@ -2378,7 +2403,7 @@ struct GitClient: Sendable {
             .compactMap { line -> GitReference? in
                 let fields = line.split(
                     separator: "\t",
-                    maxSplits: 4,
+                    maxSplits: 5,
                     omittingEmptySubsequences: false
                 )
                 guard let fullName = fields.first.map(String.init) else { return nil }
@@ -2390,7 +2415,14 @@ struct GitClient: Sendable {
                         upstreamID = candidate
                     }
                 }
-                let parsedReference = reference(fullName: fullName, isHead: isHead)
+                let symbolicTarget = fields.count > 5
+                    ? String(fields[5]).nilIfEmpty
+                    : nil
+                let parsedReference = reference(
+                    fullName: fullName,
+                    isHead: isHead,
+                    symbolicTarget: symbolicTarget
+                )
                 if isHead, parsedReference?.kind == .localBranch {
                     headBranchName = parsedReference?.name
                 }
@@ -2830,7 +2862,11 @@ struct GitClient: Sendable {
         return value
     }
 
-    private func reference(fullName: String, isHead: Bool) -> GitReference? {
+    private func reference(
+        fullName: String,
+        isHead: Bool,
+        symbolicTarget: String? = nil
+    ) -> GitReference? {
         let kind: GitReferenceKind
         let name: String
 
@@ -2854,7 +2890,8 @@ struct GitClient: Sendable {
             id: fullName,
             name: name,
             kind: kind,
-            isHead: isHead
+            isHead: isHead,
+            symbolicTarget: symbolicTarget
         )
     }
 

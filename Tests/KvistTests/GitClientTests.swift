@@ -1103,12 +1103,24 @@ final class GitClientTests: XCTestCase {
 
         let snapshot = try client.snapshot()
         let headHash = try XCTUnwrap(snapshot.headHash)
+        let main = try XCTUnwrap(snapshot.references.first {
+            $0.kind == .localBranch && $0.name == "main"
+        })
+        let feature = try XCTUnwrap(snapshot.references.first {
+            $0.kind == .localBranch && $0.name == "feature/graph"
+        })
+        let remoteHead = try XCTUnwrap(snapshot.references.first {
+            $0.name == "origin/HEAD"
+        })
         let headRow = try XCTUnwrap(snapshot.graph.first(where: { $0.commit.hash == headHash }))
         let featureRow = try XCTUnwrap(snapshot.graph.first(where: {
             $0.commit.subject == "Feature"
         }))
 
         XCTAssertEqual(headRow.kind, .head)
+        XCTAssertEqual(remoteHead.symbolicTarget, "refs/remotes/origin/main")
+        XCTAssertTrue(main.isRemoteDefaultBranch(in: snapshot.references))
+        XCTAssertFalse(feature.isRemoteDefaultBranch(in: snapshot.references))
         XCTAssertEqual(headRow.commit.parentHashes.count, 2)
         XCTAssertTrue(headRow.commit.references.contains(where: {
             $0.kind == .localBranch && $0.name == "main" && $0.isHead
