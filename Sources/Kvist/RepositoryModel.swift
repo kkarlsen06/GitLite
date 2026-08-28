@@ -244,6 +244,7 @@ final class RepositoryModel: ObservableObject {
     private var repositoryFileTextRevision = 0
     private var liveRefreshTask: Task<Void, Never>?
     private var workingTreeRefreshTask: Task<Void, Never>?
+    private var autoFetchTask: Task<Void, Never>?
     private var repositoryWatchPaths: [String] = []
     private var repositoryWatchSinceEventID = RepositoryWatcher.currentEventID()
     private var monitoringEnabled: Bool
@@ -295,6 +296,7 @@ final class RepositoryModel: ObservableObject {
         workingTreeSnapshotLoadTask?.cancel()
         liveRefreshTask?.cancel()
         workingTreeRefreshTask?.cancel()
+        autoFetchTask?.cancel()
         repositoryWatcher?.stop()
         gitPreviewDirectoryStore.removeAll()
     }
@@ -500,7 +502,10 @@ final class RepositoryModel: ObservableObject {
                 repositoryFilesRevision &+= 1
                 startWatching(paths: repositoryWatchPaths)
             }
+            startAutoFetching()
         } else {
+            autoFetchTask?.cancel()
+            autoFetchTask = nil
             liveRefreshTask?.cancel()
             workingTreeRefreshTask?.cancel()
             liveRefreshTask = nil
@@ -686,6 +691,8 @@ final class RepositoryModel: ObservableObject {
         snapshotRequestID = UUID()
         liveRefreshTask?.cancel()
         workingTreeRefreshTask?.cancel()
+        autoFetchTask?.cancel()
+        autoFetchTask = nil
         repositorySnapshotLoadTask?.cancel()
         graphHistoryLoadTask?.cancel()
         graphHistoryLoadTask = nil
@@ -915,7 +922,8 @@ final class RepositoryModel: ObservableObject {
 
     private func refresh(
         activityMessage: String,
-        blocksActions: Bool
+        blocksActions: Bool,
+        presentsErrors: Bool = true
     ) async {
         guard let repositoryURL,
               !isBusy,
@@ -986,7 +994,8 @@ final class RepositoryModel: ObservableObject {
             repositorySnapshotLoadTask = nil
             if !(error is CancellationError),
                snapshotRequestID == requestID,
-               self.repositoryURL == repositoryURL {
+               self.repositoryURL == repositoryURL,
+               presentsErrors {
                 present(error)
             }
         }
@@ -2780,6 +2789,21 @@ final class RepositoryModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    func autoFetch(applicationIsActive: Bool) async -> Bool? {
+        guard applicationIsActive,
+              !remotes.isEmpty,
+              !isBusy,
+              !isSavingRepositoryFile,
+              !isGeneratingCommitMessage,
+              !hasPendingChangeOperations,
+              !isRefreshInProgress,
+              !isLoadingMoreGraph else { return nil }
+        return await perform("Fetching…", presentsErrors: false) {
+            _ = try $0.fetch()
+        }
+    }
+
     func pull() async {
         await withSyncActivity {
             await self.perform("Pulling…") { _ = try $0.pull() }
@@ -3595,6 +3619,7 @@ final class RepositoryModel: ObservableObject {
     @discardableResult
     private func perform(
         _ message: String,
+        presentsErrors: Bool = true,
         operation: @escaping @Sendable (GitClient) throws -> Void
     ) async -> Bool {
         guard let repositoryURL,
@@ -3610,17 +3635,25 @@ final class RepositoryModel: ObservableObject {
         do {
             try await mutationQueue.run(client: client, operation: operation)
             isBusy = false
-            await refresh()
+            await refresh(
+                activityMessage: "Refreshing…",
+                blocksActions: true,
+                presentsErrors: presentsErrors
+            )
             return true
         } catch {
             let commandError = error
             isBusy = false
-            await refresh()
+            await refresh(
+                activityMessage: "Refreshing…",
+                blocksActions: true,
+                presentsErrors: presentsErrors
+            )
             if activeOperation == .rebase,
                hasUnresolvedConflicts,
                (commandError as? GitCommandError)?.rebaseConflictPresentation != nil {
                 activity = "Rebase paused"
-            } else {
+            } else if presentsErrors {
                 present(commandError)
             }
             return false
@@ -3672,6 +3705,12 @@ final class RepositoryModel: ObservableObject {
         activeOperation: GitOperation?
     ) {
         if self.remotes != remotes { self.remotes = remotes }
+        if remotes.isEmpty {
+            autoFetchTask?.cancel()
+            autoFetchTask = nil
+        } else if autoFetchTask == nil {
+            startAutoFetching()
+        }
         if self.activeOperation != activeOperation {
             self.activeOperation = activeOperation
         }
@@ -3913,6 +3952,35 @@ final class RepositoryModel: ObservableObject {
         }
         repositoryWatcher = watcher
         watcher.start()
+    }
+
+    private func startAutoFetching() {
+        guard monitoringEnabled,
+              repositoryURL != nil,
+              !remotes.isEmpty,
+              autoFetchTask == nil else { return }
+        autoFetchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let shouldContinue = self.map({
+                    $0.monitoringEnabled
+                        && $0.repositoryURL != nil
+                        && !$0.remotes.isEmpty
+                }), shouldContinue else { return }
+                let delay: Duration
+                if !NSApplication.shared.isActive {
+                    delay = .seconds(15)
+                } else if await self?.autoFetch(applicationIsActive: true) == nil {
+                    delay = .seconds(1)
+                } else {
+                    delay = .seconds(180)
+                }
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+            }
+        }
     }
 
     private func minimizedWatchPaths(_ paths: [String]) -> [String] {

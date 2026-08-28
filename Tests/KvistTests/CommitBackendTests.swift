@@ -1049,6 +1049,46 @@ final class CommitBackendTests: XCTestCase {
     }
 
     @MainActor
+    func testAutoFetchUpdatesRemoteState() async throws {
+        let bareURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KvistAutoFetchOrigin-\(UUID().uuidString).git")
+        let peerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KvistAutoFetchPeer-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: bareURL)
+            try? FileManager.default.removeItem(at: peerURL)
+        }
+
+        try commitFile(path: "base.txt", contents: "base\n", message: "Base")
+        try git(["init", "--bare", bareURL.path])
+        try git(["remote", "add", "origin", bareURL.path])
+        try git(["push", "--set-upstream", "origin", "main"])
+        try git(["clone", "--branch", "main", bareURL.path, peerURL.path])
+        try git(["config", "user.name", "Kvist Test"], in: peerURL)
+        try git(["config", "user.email", "kvist@example.invalid"], in: peerURL)
+
+        let model = RepositoryModel(
+            restoresLastRepository: false,
+            persistsLastRepository: false,
+            monitoringEnabled: false
+        )
+        await model.openRepository(repositoryURL)
+
+        try "remote\n".write(
+            to: peerURL.appendingPathComponent("remote.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try git(["add", "remote.txt"], in: peerURL)
+        try git(["commit", "-m", "Remote"], in: peerURL)
+        try git(["push"], in: peerURL)
+
+        XCTAssertEqual(model.behind, 0)
+        await model.autoFetch(applicationIsActive: true)
+        XCTAssertEqual(model.behind, 1)
+    }
+
+    @MainActor
     func testRepositoryModelLoadsOlderCommitsByPage() async throws {
         try commitFile(path: "one.txt", contents: "one\n", message: "One")
         try commitFile(path: "two.txt", contents: "two\n", message: "Two")
