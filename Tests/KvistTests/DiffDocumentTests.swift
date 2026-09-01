@@ -28,6 +28,58 @@ final class DiffDocumentTests: XCTestCase {
         )
     }
 
+    func testLineComparerHighlightsOnlyTheChangedWhitespaceAndWords() {
+        let spacing = DiffLineComparer.changedRanges(
+            removed: "let value  = compute(a, b)",
+            added: "let value = compute(a, b)"
+        )
+        XCTAssertEqual(spacing.removed, [NSRange(location: 9, length: 2)])
+        XCTAssertEqual(spacing.added, [NSRange(location: 9, length: 1)])
+
+        let words = DiffLineComparer.changedRanges(
+            removed: "return first + second",
+            added: "return first - third"
+        )
+        XCTAssertEqual(
+            words.removed,
+            [NSRange(location: 13, length: 1), NSRange(location: 15, length: 6)]
+        )
+        XCTAssertEqual(
+            words.added,
+            [NSRange(location: 13, length: 1), NSRange(location: 15, length: 5)]
+        )
+
+        let rewritten = DiffLineComparer.changedRanges(
+            removed: "alpha beta gamma",
+            added: "one two three four"
+        )
+        XCTAssertEqual(rewritten, DiffLineComparer.Changes(removed: [], added: []))
+    }
+
+    func testFormatterEmphasizesPairedChangesWithinAHunk() throws {
+        let diff = """
+        @@ -1,3 +1,3 @@
+         context
+        -let a  = 1
+        -unchanged line
+        +let a = 1
+        +unchanged line
+        """
+
+        let document = try XCTUnwrap(DiffDocumentFormatter.formattedDocument(for: diff))
+        let text = document.text as NSString
+
+        XCTAssertEqual(document.emphasisRanges.count, 2)
+        XCTAssertEqual(
+            document.emphasisRanges.map { text.substring(with: $0) },
+            ["  ", " "]
+        )
+        let removedLine = text.range(of: "-let a  = 1")
+        XCTAssertTrue(NSLocationInRange(document.emphasisRanges[0].location, removedLine))
+        let addedLine = text.range(of: "+let a = 1")
+        XCTAssertTrue(NSLocationInRange(document.emphasisRanges[1].location, addedLine))
+    }
+
     func testFormatterHandlesLargeDiffWithoutMaterializingLineModels() throws {
         let changedLineCount = 1_000_000
         var diff = "@@ -0,0 +1,\(changedLineCount) @@"

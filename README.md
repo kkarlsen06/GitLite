@@ -1,10 +1,13 @@
 # Kvist
 
-Kvist is a compact native macOS client for Git® repositories.
+Kvist is a compact native macOS client for Git® repositories, and a file
+browser and editor for any folder on a remote machine over SSH.
 
 ## Included
 
 - Open, clone, or initialize a Git repository, reopen it from the recents list, or drop a folder on the welcome screen
+- Open a repository or any folder over SSH: Git repositories get the full workspace, other folders open as a remote file browser and editor with no Git required, and either can be initialized as a repository later
+- Browse a local folder without Git, then initialize it from the Files view when you are ready
 - Keep multiple repositories open in compact title-bar tabs (`⌘T` / `⌘W`, cycle with `⇧⌘[` / `⇧⌘]`)
 - Recover open tabs, the selected workspace, expanded folders, commit text, and unsaved editor drafts after reopening Kvist
 - Switch between Git and Files modes
@@ -12,7 +15,7 @@ Kvist is a compact native macOS client for Git® repositories.
 - Create, rename, delete, and check out local or remote-tracking branches
 - View staged, modified, deleted, renamed, and untracked files
 - Stage or unstage one file or all files, stash changes, or discard all changes with confirmation
-- Inspect working-tree and staged diffs
+- Inspect working-tree and staged diffs with character-level highlights for the changed parts of a line
 - Commit with `⌘Return`
 - Refresh automatically when the worktree, index, refs, or HEAD changes
 - Resize the graph vertically and the Git/diff split horizontally with their dividers
@@ -30,7 +33,7 @@ Kvist is a compact native macOS client for Git® repositories.
 
 Before downloading an Open VSX result, Kvist verifies that it is categorized as a theme, is downloadable, and declares a license. Imported themes remain subject to their publisher's license.
 
-Kvist uses SwiftUI and the system `git` command. It does not embed Chromium, Electron, or an editor.
+Kvist uses SwiftUI, the system `git` command, and your existing `ssh` configuration and keys. Remote files are listed with `find`, transferred with `rsync`, and searched with `grep` when the folder has no Git repository. It does not embed Chromium, Electron, or an editor.
 
 ## Performance model
 

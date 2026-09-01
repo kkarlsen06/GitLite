@@ -84,8 +84,12 @@ final class RepositoryTab: ObservableObject, Identifiable {
         isRepositoryLoadPending = true
         let generation = UUID()
         activationGeneration = generation
+        let opensAsPlainFolder = pendingRestorationState?.opensAsPlainFolder ?? false
         activationTask = Task { [weak self, weak model] in
-            await model?.openRepository(repositoryURL)
+            await model?.openRepository(
+                repositoryURL,
+                asPlainFolder: opensAsPlainFolder
+            )
             guard let self,
                   self.activationGeneration == generation else { return }
             if let state = self.pendingRestorationState {

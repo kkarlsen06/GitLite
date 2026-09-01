@@ -81,6 +81,7 @@ private struct RepositoryOpenResult: Sendable {
     let remotes: [GitRemote]
     let activeOperation: GitOperation?
     let watchPaths: [String]
+    let isPlainFolder: Bool
 }
 
 private struct RepositoryRefreshResult: Sendable {
@@ -107,6 +108,9 @@ struct RepositoryErrorPresentation: Equatable {
 final class RepositoryModel: ObservableObject {
     @Published private(set) var repositoryURL: URL?
     @Published private(set) var sshRepository: SSHRepository?
+    /// The open folder is browsed and edited without Git: no snapshot,
+    /// history, remotes, or source-control mode.
+    @Published private(set) var isPlainFolder = false
     @Published private(set) var repositoryInitializationURL: URL?
     private(set) var deferredRepositoryOpenURL: URL?
     @Published private(set) var branch = ""
@@ -232,6 +236,7 @@ final class RepositoryModel: ObservableObject {
     private var repositoryWatcher: RepositoryWatcher?
     private var repositoryOpenLoadTask: Task<RepositoryOpenResult, Error>?
     private var repositoryCloneTask: Task<URL, Error>?
+    private var sshProbeTask: Task<SSHPathKind, Error>?
     private var repositorySnapshotLoadTask: Task<RepositoryRefreshResult, Error>?
     private var workingTreeSnapshotLoadTask: Task<WorkingTreeSnapshot, Error>?
     private var repositoryFileSession: RepositoryFileSession?
@@ -338,11 +343,16 @@ final class RepositoryModel: ObservableObject {
             expandedCommitHashes: expandedCommitHashes,
             graphScope: graphScope,
             commitMessage: commitMessage,
-            editor: workspaceMode == .fileEditor ? activeEditor : rememberedEditor
+            editor: workspaceMode == .fileEditor ? activeEditor : rememberedEditor,
+            opensAsPlainFolder: isPlainFolder
         )
     }
 
     func restore(from state: RepositoryRestorationState) async {
+        var state = state
+        if isPlainFolder {
+            state.workspaceMode = .fileEditor
+        }
         commitMessage = state.commitMessage
         expandedFileDirectories = state.expandedFileDirectories
 
@@ -642,19 +652,66 @@ final class RepositoryModel: ObservableObject {
         return name
     }
 
-    func openRepository(_ url: URL) async {
+    func openRepository(_ url: URL, asPlainFolder: Bool = false) async {
         let marker = url.appendingPathComponent(".kvist-ssh")
         if let data = try? Data(contentsOf: marker),
            let sshRepository = try? JSONDecoder().decode(SSHRepository.self, from: data) {
             await openRepository(url, overSSH: sshRepository)
             return
         }
-        await openRepository(url, overSSH: nil)
+        await openRepository(url, overSSH: nil, asPlainFolder: asPlainFolder)
     }
 
+    /// Opens a local folder as a file browser and editor without Git.
+    func openFolderWithoutGit(_ url: URL) async {
+        await openRepository(url, overSSH: nil, asPlainFolder: true)
+    }
+
+    /// Leaves the initialize-repository screen and browses the folder's
+    /// files without creating a Git repository.
+    func browseFolderWithoutGit() async {
+        guard let url = repositoryInitializationURL, !isBusy else { return }
+        repositoryInitializationURL = nil
+        await openFolderWithoutGit(url)
+    }
+
+    /// Opens a remote path over SSH. Git repositories get the full
+    /// source-control workspace; any other folder opens as a file browser
+    /// and editor.
     func openSSHRepository(host: String, path: String) async {
+        guard !isBusy,
+              !isSavingRepositoryFile,
+              !isGeneratingCommitMessage,
+              !hasPendingChangeOperations else { return }
         do {
-            let sshRepository = try SSHRepository(host: host, path: path)
+            let location = try SSHRepository(host: host, path: path)
+            isBusy = true
+            activity = "Connecting to \(location.host)…"
+            let probeTask = Task.detached(priority: .userInitiated) {
+                try GitClient.probeSSHPath(host: location.host, path: location.path)
+            }
+            sshProbeTask = probeTask
+            let kind: SSHPathKind
+            do {
+                kind = try await withTaskCancellationHandler {
+                    try await probeTask.value
+                } onCancel: {
+                    probeTask.cancel()
+                }
+            } catch {
+                sshProbeTask = nil
+                isBusy = false
+                activity = repositoryURL == nil ? "Ready" : "Up to date"
+                if !(error is CancellationError) { present(error) }
+                return
+            }
+            sshProbeTask = nil
+            isBusy = false
+            let sshRepository = try SSHRepository(
+                host: location.host,
+                path: location.path,
+                isGitRepository: kind == .repository
+            )
             let base = FileManager.default.urls(
                 for: .applicationSupportDirectory,
                 in: .userDomainMask
@@ -676,7 +733,11 @@ final class RepositoryModel: ObservableObject {
         }
     }
 
-    private func openRepository(_ url: URL, overSSH sshRepository: SSHRepository?) async {
+    private func openRepository(
+        _ url: URL,
+        overSSH sshRepository: SSHRepository?,
+        asPlainFolder: Bool = false
+    ) async {
         guard !isBusy,
               !isSavingRepositoryFile,
               !isGeneratingCommitMessage,
@@ -708,8 +769,34 @@ final class RepositoryModel: ObservableObject {
         do {
             let maxGraphCount = graphPageSize
             let historyScope = graphScope.gitScope
+            let opensPlainFolder = asPlainFolder
+                || sshRepository?.isGitRepository == false
             let loadTask = Task.detached(priority: .userInitiated) {
                 try Task.checkCancellation()
+                if opensPlainFolder {
+                    if sshRepository == nil {
+                        var isDirectory: ObjCBool = false
+                        guard FileManager.default.fileExists(
+                            atPath: url.path,
+                            isDirectory: &isDirectory
+                        ), isDirectory.boolValue else {
+                            throw GitCommandError(
+                                command: "open folder",
+                                output: "There is no folder at \(url.path)."
+                            )
+                        }
+                    }
+                    return RepositoryOpenResult(
+                        rootURL: url,
+                        snapshot: .empty,
+                        remotes: [],
+                        activeOperation: nil,
+                        watchPaths: sshRepository == nil
+                            ? [url.standardizedFileURL.path]
+                            : [],
+                        isPlainFolder: true
+                    )
+                }
                 let root: URL
                 if let sshRepository {
                     root = url
@@ -742,7 +829,8 @@ final class RepositoryModel: ObservableObject {
                     snapshot: loadedSnapshot,
                     remotes: try await remotes,
                     activeOperation: loadedSnapshot.activeOperation,
-                    watchPaths: try await watchPaths
+                    watchPaths: try await watchPaths,
+                    isPlainFolder: false
                 )
             }
             repositoryOpenLoadTask = loadTask
@@ -768,6 +856,7 @@ final class RepositoryModel: ObservableObject {
             let openedRepositoryRoot = result.rootURL.standardizedFileURL.path
             repositoryURL = result.rootURL
             self.sshRepository = sshRepository
+            isPlainFolder = result.isPlainFolder
             deferredRepositoryOpenURL = nil
             repositoryInitializationURL = nil
             if previousRepositoryRoot != openedRepositoryRoot {
@@ -775,6 +864,9 @@ final class RepositoryModel: ObservableObject {
                 isAmendingCommit = false
                 workspaceMode = .sourceControl
                 expandedFileDirectories = []
+            }
+            if result.isPlainFolder {
+                workspaceMode = .fileEditor
             }
             dismissRepositorySearch(clearingQuery: true)
             graphLimit = graphPageSize
@@ -853,6 +945,12 @@ final class RepositoryModel: ObservableObject {
     }
 
     func cancelRepositoryOpen() {
+        if let sshProbeTask {
+            sshProbeTask.cancel()
+            self.sshProbeTask = nil
+            isBusy = false
+            activity = repositoryURL == nil ? "Ready" : "Up to date"
+        }
         if repositoryCloneTask != nil {
             repositoryCloneTask?.cancel()
             repositoryCloneTask = nil
@@ -886,21 +984,52 @@ final class RepositoryModel: ObservableObject {
               !isGeneratingCommitMessage,
               !hasPendingChangeOperations else { return }
 
+        // A folder opened without Git over SSH initializes on the remote
+        // machine; the marker is rewritten so the reopened tab gets Git.
+        let sshFolder = isPlainFolder
+            && repositoryURL?.standardizedFileURL == url.standardizedFileURL
+            ? sshRepository
+            : nil
         isBusy = true
         activity = "Initializing repository…"
         do {
-            try await Task.detached(priority: .userInitiated) {
-                try GitClient.initializeRepository(
-                    at: url,
-                    createGitIgnore: createGitIgnore
+            if let sshFolder {
+                let client = GitClient(repositoryURL: url, sshRepository: sshFolder)
+                try await Task.detached(priority: .userInitiated) {
+                    try client.initializeSSHRepository(createGitIgnore: createGitIgnore)
+                }.value
+                let repository = try SSHRepository(
+                    host: sshFolder.host,
+                    path: sshFolder.path,
+                    isGitRepository: true
                 )
-            }.value
+                try JSONEncoder().encode(repository).write(
+                    to: url.appendingPathComponent(".kvist-ssh"),
+                    options: .atomic
+                )
+            } else {
+                try await Task.detached(priority: .userInitiated) {
+                    try GitClient.initializeRepository(
+                        at: url,
+                        createGitIgnore: createGitIgnore
+                    )
+                }.value
+            }
             isBusy = false
+            repositoryInitializationURL = nil
             await openRepository(url)
         } catch {
             isBusy = false
             present(error)
         }
+    }
+
+    /// Shows the initialize-repository screen for a folder that is open
+    /// without Git, so Git can be added later without reopening the folder.
+    func requestRepositoryInitialization() {
+        guard isPlainFolder, let repositoryURL, !isBusy else { return }
+        repositoryInitializationURL = repositoryURL
+        activity = "Repository setup required"
     }
 
     func cancelRepositoryInitialization() {
@@ -931,6 +1060,18 @@ final class RepositoryModel: ObservableObject {
               !isGeneratingCommitMessage else { return }
         guard !isRefreshInProgress else {
             pendingLiveRefresh = true
+            return
+        }
+        if isPlainFolder {
+            // Nothing from Git to reload. Remote folders re-list their files;
+            // local folders are already kept current by the watcher.
+            pendingLiveRefresh = false
+            pendingWorkingTreeRefresh = false
+            if sshRepository != nil {
+                repositoryFilesRevision &+= 1
+                scheduleRepositorySearch(presentsResults: false)
+            }
+            activity = "Up to date"
             return
         }
         isRefreshInProgress = true
@@ -1020,6 +1161,10 @@ final class RepositoryModel: ObservableObject {
               !isGeneratingCommitMessage else { return }
         guard !isRefreshInProgress else {
             pendingWorkingTreeRefresh = true
+            return
+        }
+        if isPlainFolder {
+            pendingWorkingTreeRefresh = false
             return
         }
         isRefreshInProgress = true
@@ -1343,6 +1488,7 @@ final class RepositoryModel: ObservableObject {
         guard mode != workspaceMode else { return }
         guard !isSavingRepositoryFile else { return }
         guard mode == .sourceControl || repositoryURL != nil else { return }
+        guard mode == .fileEditor || !isPlainFolder else { return }
         switch (workspaceMode, mode) {
         case (.fileEditor, .sourceControl):
             dismissRepositorySearch()
@@ -1770,6 +1916,7 @@ final class RepositoryModel: ObservableObject {
         let revision = repositoryFilesRevision
         let editedPath = selectedRepositoryFilePath
         let editedText = repositoryFileText
+        let searchesPlainFolder = isPlainFolder
         repositorySearchTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: .milliseconds(160))
@@ -1778,7 +1925,9 @@ final class RepositoryModel: ObservableObject {
                     sshRepository: self?.sshRepository
                 )
                 let searchTask = Task.detached(priority: .userInitiated) {
-                    try client.searchRepository(for: query)
+                    searchesPlainFolder
+                        ? try client.searchFolder(for: query)
+                        : try client.searchRepository(for: query)
                 }
                 var results = try await withTaskCancellationHandler {
                     try await searchTask.value

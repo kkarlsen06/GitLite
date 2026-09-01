@@ -232,7 +232,17 @@ private struct RepositoryStatusBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            if model.repositoryURL != nil {
+            if model.repositoryURL != nil, model.isPlainFolder {
+                plainFolderLabel
+
+                Spacer(minLength: 0)
+
+                if showsActivity {
+                    activityLabel
+
+                    Spacer(minLength: 0)
+                }
+            } else if model.repositoryURL != nil {
                 branchMenu
 
                 Spacer(minLength: 0)
@@ -267,6 +277,28 @@ private struct RepositoryStatusBar: View {
                 .frame(height: 1)
         }
         .foregroundStyle(AppTheme.primary)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var plainFolderLabel: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(AppTheme.secondary)
+            Text(model.repositoryURL?.lastPathComponent ?? "Folder")
+                .font(.system(size: 12, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Button("Not a Git repository") {
+                model.requestRepositoryInitialization()
+            }
+            .buttonStyle(.plain)
+            .font(AppType.caption)
+            .foregroundStyle(AppTheme.muted)
+            .disabled(model.isBusy)
+            .accessibilityLabel("Initialize Git Repository")
+            .help("Initialize a Git repository in this folder")
+        }
         .accessibilityElement(children: .contain)
     }
 
@@ -1015,6 +1047,7 @@ private struct RepositoryEditorPanel: View {
                 }
 
                 if model.workspaceMode == .fileEditor,
+                   !model.isPlainFolder,
                    model.selectedRepositoryFilePath != nil {
                     Button {
                         model.showChangesForCurrentFile()
@@ -2399,7 +2432,11 @@ private struct InitializeRepositoryView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
 
-                    Text("This folder is not currently tracked by Git.")
+                    Text(
+                        model.sshRepository.map {
+                            "This folder on \($0.host) is not currently tracked by Git."
+                        } ?? "This folder is not currently tracked by Git."
+                    )
                         .font(.system(size: 12))
                         .foregroundStyle(AppTheme.muted)
                 }
@@ -2416,6 +2453,14 @@ private struct InitializeRepositoryView: View {
                         Task { await model.initializeRepository(createGitIgnore: false) }
                     }
                     .buttonStyle(.plain)
+
+                    if !model.isPlainFolder {
+                        Button("Browse Files Without Git") {
+                            Task { await model.browseFolderWithoutGit() }
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open this folder as a file browser and editor")
+                    }
 
                     Button("Choose Another Folder…") {
                         model.chooseRepository()
@@ -2459,7 +2504,7 @@ private struct WelcomeView: View {
                 BranchGlyph(size: 38, color: AppTheme.graphBlue)
 
                 VStack(spacing: 6) {
-                    Text("Open a Git repository")
+                    Text("Open a repository or folder")
                         .font(.system(size: 16, weight: .semibold))
 
                     Text("Drop a folder here, or press ⌘O to browse.")
@@ -2502,7 +2547,7 @@ private struct WelcomeView: View {
                         || model.isGeneratingCommitMessage
                         || model.hasPendingChangeOperations
                 )
-                .help("Run Git directly in a repository on a remote machine")
+                .help("Browse and edit files on a remote machine, with Git when the folder is a repository")
             }
 
             if !recentRepositories.isEmpty {
@@ -6447,12 +6492,12 @@ private enum GitPrompt {
 
     static func sshRepository() -> (host: String, path: String)? {
         let result = AppDialog.run(
-            title: "Open Repository over SSH",
-            message: "Kvist uses your existing SSH config and keys to run Git on the remote machine. Leave the path empty to browse the remote machine's folders.",
+            title: "Open over SSH",
+            message: "Kvist uses your existing SSH config and keys. Git repositories open with source control; any other folder opens as a file browser and editor. Leave the path empty to browse the remote machine's folders.",
             fields: [
                 AppDialogField(label: "SSH host", placeholder: "user@example.com"),
                 AppDialogField(
-                    label: "Repository path",
+                    label: "Remote path",
                     placeholder: "Optional — leave empty to browse",
                     isRequired: false
                 )

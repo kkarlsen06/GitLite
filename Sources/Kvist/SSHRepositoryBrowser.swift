@@ -312,7 +312,7 @@ struct SSHRepositoryBrowserView: View {
                     .scaledToFit()
                     .frame(width: 24, height: 24)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Open Repository over SSH")
+                    Text("Open over SSH")
                         .font(AppType.sectionTitle)
                     Text(host)
                         .font(AppType.caption)
@@ -450,7 +450,21 @@ struct SSHRepositoryBrowserView: View {
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
-            .contextMenu(forSelectionType: String.self) { _ in
+            .contextMenu(forSelectionType: String.self) { tags in
+                if let tag = tags.first,
+                   let path = resolvedPath(fromTag: tag),
+                   let entry = model.entries.first(where: { $0.path == path }) {
+                    if entry.kind == .repository {
+                        Button("Open Repository") { open(entry.path) }
+                    } else {
+                        Button("Open Folder Without Git") { open(entry.path) }
+                        Button("Show Contents") { model.navigate(to: entry.path) }
+                    }
+                } else if let tag = tags.first, tag.hasPrefix(Self.suggestionTagPrefix) {
+                    Button("Open Repository") {
+                        open(String(tag.dropFirst(Self.suggestionTagPrefix.count)))
+                    }
+                }
             } primaryAction: { tags in
                 handlePrimaryAction(tags)
             }
@@ -506,22 +520,27 @@ struct SSHRepositoryBrowserView: View {
     private var footer: some View {
         HStack(spacing: 10) {
             TextField(
-                "Repository path",
+                "Remote path",
                 text: $pathText,
                 prompt: Text("/srv/repository")
             )
             .textFieldStyle(.roundedBorder)
             .font(AppType.rowDetail)
             .onSubmit { openIfValid() }
-            .accessibilityLabel("Repository path")
+            .accessibilityLabel("Remote path")
 
             Button("Cancel") { dismiss() }
                 .keyboardShortcut(.cancelAction)
 
-            Button("Open Repository") { openIfValid() }
+            Button(openButtonTitle) { openIfValid() }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
                 .disabled(!canOpen)
+                .help(
+                    opensRepository
+                        ? "Open this Git repository"
+                        : "Browse and edit this folder's files without Git"
+                )
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -529,6 +548,25 @@ struct SSHRepositoryBrowserView: View {
 
     private var canOpen: Bool {
         pathText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")
+    }
+
+    /// The button names what the typed or selected path will open as, so a
+    /// plain folder is never mistaken for a repository. A typed path the
+    /// browser has not listed reads "Open Folder"; the model probes it on
+    /// open and still gives a Git repository the full workspace.
+    private var openButtonTitle: String {
+        opensRepository ? "Open Repository" : "Open Folder"
+    }
+
+    private var opensRepository: Bool {
+        let path = pathText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path == model.currentPath {
+            return model.currentDirectoryKind == .repository
+        }
+        if let entry = model.entries.first(where: { $0.path == path }) {
+            return entry.kind == .repository
+        }
+        return model.suggestions.contains(path)
     }
 
     private var showsSuggestions: Bool {

@@ -265,6 +265,29 @@ struct RepositorySnapshot: Sendable {
     let graphHasMore: Bool
     let graphLayoutState: GraphLayoutState
     let referencesByCommitHash: [String: [GitReference]]
+
+    /// The snapshot of a folder opened without Git: nothing to show in the
+    /// source-control views.
+    static let empty = RepositorySnapshot(
+        branch: "",
+        staged: [],
+        unstaged: [],
+        resolveUndoPaths: [],
+        graph: [],
+        references: [],
+        upstreamReference: nil,
+        headHash: nil,
+        ahead: 0,
+        behind: 0,
+        hasUpstream: false,
+        isRebaseInProgress: false,
+        activeOperation: nil,
+        fastForwardReferenceIDs: [],
+        historyOffset: 0,
+        graphHasMore: false,
+        graphLayoutState: GraphLayoutState(),
+        referencesByCommitHash: [:]
+    )
 }
 
 struct WorkingTreeSnapshot: Sendable {
@@ -462,18 +485,37 @@ struct PredictedMergeConflictError: LocalizedError, Sendable {
 struct SSHRepository: Codable, Equatable, Sendable {
     let host: String
     let path: String
+    /// `false` when the remote folder is browsed and edited without Git.
+    let isGitRepository: Bool
 
-    init(host: String, path: String) throws {
+    init(host: String, path: String, isGitRepository: Bool = true) throws {
         let host = try Self.validatedHost(host)
         let path = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard path.hasPrefix("/") else {
             throw GitCommandError(
                 command: "ssh",
-                output: "Enter an SSH host such as user@example.com and an absolute repository path."
+                output: "Enter an SSH host such as user@example.com and an absolute remote path."
             )
         }
         self.host = host
         self.path = path
+        self.isGitRepository = isGitRepository
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case host, path, isGitRepository
+    }
+
+    /// Markers written before folder mode existed carry no kind and are
+    /// Git repositories.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        host = try container.decode(String.self, forKey: .host)
+        path = try container.decode(String.self, forKey: .path)
+        isGitRepository = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .isGitRepository
+        ) ?? true
     }
 
     static func validatedHost(_ host: String) throws -> String {
@@ -500,6 +542,15 @@ struct SSHFileEntry: Sendable {
     let name: String
     let isDirectory: Bool
     let isSymbolicLink: Bool
+}
+
+/// What Kvist found at a remote path before opening it.
+enum SSHPathKind: Equatable, Sendable {
+    /// The path is the root of a Git working tree.
+    case repository
+    /// The path is a folder with no Git repository (or no `git` binary), so
+    /// Kvist opens it as a plain file browser and editor.
+    case folder
 }
 
 struct GitClient: Sendable {
@@ -623,6 +674,26 @@ struct GitClient: Sendable {
         }
     }
 
+    /// Turns a remote folder opened without Git into a repository. The
+    /// recommended `.gitignore` is written to the local cache and uploaded,
+    /// mirroring how edited files reach the remote machine.
+    func initializeSSHRepository(createGitIgnore: Bool) throws {
+        guard let sshRepository else { return }
+        _ = try run(["init"])
+        let remoteGitIgnore = Self.shellQuote(
+            URL(fileURLWithPath: sshRepository.path)
+                .appendingPathComponent(".gitignore").path
+        )
+        let remoteHasGitIgnore = (try? runSSH("test -e \(remoteGitIgnore)")) != nil
+        if createGitIgnore, !remoteHasGitIgnore {
+            try Self.createRecommendedGitIgnore(at: repositoryURL)
+            try uploadSSHFile(
+                repositoryURL.appendingPathComponent(".gitignore"),
+                relativePath: ".gitignore"
+            )
+        }
+    }
+
     static func cloneRepository(from remoteURL: String, to destinationURL: URL) throws -> URL {
         let source = try validatedRemoteURL(remoteURL, command: "git clone")
         let destination = destinationURL.standardizedFileURL
@@ -722,6 +793,152 @@ struct GitClient: Sendable {
                 output: "The SSH path must be the repository root. Git reported \(root)."
             )
         }
+    }
+
+    /// Decides whether a remote path opens as a Git repository or as a plain
+    /// folder. Missing folders and paths inside (but not at the root of) a
+    /// repository are errors, matching `validateSSHRepository`.
+    static func probeSSHPath(host: String, path: String) throws -> SSHPathKind {
+        let script = """
+        p=\(shellQuote(path))
+        if [ ! -d "$p" ]; then printf 'missing'; exit 0; fi
+        cd "$p" 2>/dev/null || { printf 'unreadable'; exit 0; }
+        top=$(git rev-parse --show-toplevel 2>/dev/null) || { printf 'folder'; exit 0; }
+        printf 'repository\\n%s' "$top"
+        """
+        let data = try runSSH(host: host, command: posixShellCommand(script))
+        return try parseSSHPathProbe(data, path: path)
+    }
+
+    static func parseSSHPathProbe(_ data: Data, path: String) throws -> SSHPathKind {
+        let text = String(decoding: data, as: UTF8.self)
+        let lines = text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        switch lines.first.map(String.init) ?? "" {
+        case "folder":
+            return .folder
+        case "repository":
+            let root = lines.count > 1
+                ? String(lines[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+            guard root == path else {
+                throw GitCommandError(
+                    command: "git rev-parse --show-toplevel",
+                    output: "The SSH path must be the repository root. Git reported \(root)."
+                )
+            }
+            return .repository
+        case "missing":
+            throw GitCommandError(
+                command: "ssh",
+                output: "There is no folder at \(path) on the remote machine."
+            )
+        case "unreadable":
+            throw GitCommandError(
+                command: "ssh",
+                output: "Kvist cannot read \(path) on the remote machine."
+            )
+        default:
+            throw GitCommandError(command: "ssh", output: "Unexpected SSH response data.")
+        }
+    }
+
+    /// File-name and content search for a folder opened without Git: `find`
+    /// and `grep` stand in for `git ls-files` and `git grep`, locally or over
+    /// SSH. Hidden `.git` folders are skipped so a nested checkout's
+    /// metadata never shows up as matches.
+    func searchFolder(
+        for rawQuery: String,
+        fileLimit: Int = 200,
+        textLimit: Int = 300
+    ) throws -> RepositorySearchResults {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return .empty }
+        let root = sshRepository?.path ?? repositoryURL.standardizedFileURL.path
+
+        let listScript = """
+        cd \(Self.shellQuote(root)) || exit 1
+        find . -name .git -prune -o -type f -print0
+        """
+        let pathsOutput = String(
+            decoding: try runShellScript(listScript),
+            as: UTF8.self
+        )
+        let allFileMatches = RepositorySearchParser.filePaths(from: pathsOutput)
+            .map(Self.strippingCurrentDirectoryPrefix)
+            .compactMap { path -> RepositoryFileSearchMatch? in
+                guard let score = RepositoryPathMatcher.score(
+                    query: query,
+                    path: path
+                ) else {
+                    return nil
+                }
+                return RepositoryFileSearchMatch(path: path, score: score)
+            }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score < rhs.score }
+                return lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
+            }
+        let resolvedFileLimit = max(0, fileLimit)
+        let fileMatches = Array(allFileMatches.prefix(resolvedFileLimit))
+
+        try Task.checkCancellation()
+        let grepScript = """
+        cd \(Self.shellQuote(root)) || exit 1
+        grep -r -n -I -i -F --null --max-count=20 --exclude-dir=.git \
+        -e \(Self.shellQuote(query)) . 2>/dev/null
+        exit 0
+        """
+        let grepOutput = String(
+            decoding: try runShellScript(grepScript),
+            as: UTF8.self
+        )
+        let parsedTextMatches = RepositorySearchParser.textMatches(
+            fromGrepOutput: grepOutput,
+            limit: max(0, textLimit)
+        )
+
+        return RepositorySearchResults(
+            fileMatches: fileMatches,
+            textMatches: parsedTextMatches.matches,
+            fileMatchesWereLimited: allFileMatches.count > fileMatches.count,
+            textMatchesWereLimited: parsedTextMatches.wasLimited
+        )
+    }
+
+    static func strippingCurrentDirectoryPrefix(_ path: String) -> String {
+        path.hasPrefix("./") ? String(path.dropFirst(2)) : path
+    }
+
+    /// Runs a POSIX shell script on the machine that holds the files: over
+    /// SSH for remote folders, through `/bin/sh` locally otherwise.
+    private func runShellScript(_ script: String) throws -> Data {
+        if let sshRepository {
+            return try Self.runSSH(
+                host: sshRepository.host,
+                command: Self.posixShellCommand(script)
+            )
+        }
+        let process = Process()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script]
+        process.environment = Self.commandEnvironment
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        try process.run()
+        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let error = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        try Task.checkCancellation()
+        guard process.terminationStatus == 0 else {
+            throw GitCommandError(
+                command: "sh",
+                output: String(data: error, encoding: .utf8) ?? ""
+            )
+        }
+        return output
     }
 
     func sshDirectoryEntries(relativePath: String) throws -> [SSHFileEntry] {

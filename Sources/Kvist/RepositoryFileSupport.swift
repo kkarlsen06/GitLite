@@ -61,6 +61,42 @@ struct RepositoryRestorationState: Codable, Equatable {
     var graphScope: GraphScope = .all
     var commitMessage = ""
     var editor: RepositoryEditorRestorationState?
+    /// A local folder that was opened as a file browser without Git; reopened
+    /// the same way instead of landing on the initialize-repository screen.
+    var opensAsPlainFolder = false
+}
+
+extension RepositoryRestorationState {
+    private enum CodingKeys: String, CodingKey {
+        case workspaceMode, expandedFileDirectories, expandedCommitHashes
+        case graphScope, commitMessage, editor, opensAsPlainFolder
+    }
+
+    /// Tolerates workspaces saved before `opensAsPlainFolder` existed.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workspaceMode = try container.decodeIfPresent(
+            RepositoryWorkspaceMode.self, forKey: .workspaceMode
+        ) ?? .sourceControl
+        expandedFileDirectories = try container.decodeIfPresent(
+            Set<String>.self, forKey: .expandedFileDirectories
+        ) ?? []
+        expandedCommitHashes = try container.decodeIfPresent(
+            Set<String>.self, forKey: .expandedCommitHashes
+        ) ?? []
+        graphScope = try container.decodeIfPresent(
+            GraphScope.self, forKey: .graphScope
+        ) ?? .all
+        commitMessage = try container.decodeIfPresent(
+            String.self, forKey: .commitMessage
+        ) ?? ""
+        editor = try container.decodeIfPresent(
+            RepositoryEditorRestorationState.self, forKey: .editor
+        )
+        opensAsPlainFolder = try container.decodeIfPresent(
+            Bool.self, forKey: .opensAsPlainFolder
+        ) ?? false
+    }
 }
 
 struct SourceScrollRequest: Equatable {

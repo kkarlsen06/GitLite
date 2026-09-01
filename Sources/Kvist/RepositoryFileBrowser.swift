@@ -37,7 +37,11 @@ struct RepositoryFileBrowser: View {
 
     private var browserHeader: some View {
         HStack(spacing: 8) {
-            RepositoryModePicker()
+            if model.isPlainFolder {
+                PlainFolderBadge()
+            } else {
+                RepositoryModePicker()
+            }
 
             Spacer()
 
@@ -156,7 +160,9 @@ struct RepositoryFileBrowser: View {
         } else if items.isEmpty {
             FileTreeMessage(
                 symbol: "folder",
-                message: "This repository has no files."
+                message: model.isPlainFolder
+                    ? "This folder has no files."
+                    : "This repository has no files."
             )
         } else {
             ScrollView(.vertical) {
@@ -269,8 +275,38 @@ struct RepositoryReloadButton: View {
         .buttonStyle(.plain)
         .foregroundStyle(AppTheme.secondary)
         .disabled(model.isBusy)
-        .accessibilityLabel("Reload SSH Repository")
-        .help("Reload SSH Repository (⌘R)")
+        .accessibilityLabel(model.isPlainFolder ? "Reload SSH Folder" : "Reload SSH Repository")
+        .help(model.isPlainFolder ? "Reload SSH Folder (⌘R)" : "Reload SSH Repository (⌘R)")
+    }
+}
+
+/// Stands in for the Git/Files mode picker when a folder is open without
+/// Git: there is no source-control mode to switch to.
+struct PlainFolderBadge: View {
+    @EnvironmentObject private var model: RepositoryModel
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(AppTheme.secondary)
+            Text("Files")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(AppTheme.primary)
+            Button("No Git") {
+                model.requestRepositoryInitialization()
+            }
+            .buttonStyle(.plain)
+            .font(AppType.caption)
+            .foregroundStyle(AppTheme.muted)
+            .disabled(model.isBusy)
+            .accessibilityLabel("Initialize Git Repository")
+            .help("This folder is opened without Git. Click to initialize a Git repository.")
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 30)
+        .glassEffect(.regular, in: .capsule)
+        .accessibilityElement(children: .contain)
     }
 }
 

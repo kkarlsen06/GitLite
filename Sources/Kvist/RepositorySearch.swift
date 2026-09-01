@@ -186,6 +186,49 @@ enum RepositorySearchParser {
         return (matches, wasLimited)
     }
 
+    /// Parses `grep -r -n --null` records: `./path\0line:content`, one per
+    /// line. The `./` prefix from searching `.` is dropped so paths match the
+    /// file tree.
+    static func textMatches(
+        fromGrepOutput output: String,
+        limit: Int
+    ) -> (matches: [RepositoryTextSearchMatch], wasLimited: Bool) {
+        guard limit > 0 else { return ([], !output.isEmpty) }
+        var matches: [RepositoryTextSearchMatch] = []
+        var wasLimited = false
+
+        for rawRecord in output.split(separator: "\n") {
+            let fields = rawRecord.split(
+                separator: "\0",
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            )
+            guard fields.count == 2 else { continue }
+            let rest = fields[1].split(
+                separator: ":",
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            )
+            guard rest.count == 2,
+                  let line = Int(rest[0]),
+                  line > 0 else {
+                continue
+            }
+            if matches.count == limit {
+                wasLimited = true
+                break
+            }
+            let preview = rest[1]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            matches.append(RepositoryTextSearchMatch(
+                path: GitClient.strippingCurrentDirectoryPrefix(String(fields[0])),
+                line: line,
+                preview: String(preview.prefix(300))
+            ))
+        }
+        return (matches, wasLimited)
+    }
+
     static func textMatches(
         in text: String,
         path: String,

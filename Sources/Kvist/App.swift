@@ -152,6 +152,7 @@ struct KvistApp: App {
                     tabsModel.activeModel.setWorkspaceMode(.sourceControl)
                 }
                 .keyboardShortcut("1")
+                .disabled(tabsModel.activeModel.isPlainFolder)
 
                 Button("Show Files") {
                     tabsModel.activeModel.setWorkspaceMode(.fileEditor)
@@ -167,7 +168,10 @@ struct KvistApp: App {
                     tabsModel.activeModel.toggleWorkspaceMode()
                 }
                 .keyboardShortcut(.tab, modifiers: [.control])
-                .disabled(tabsModel.activeModel.repositoryURL == nil)
+                .disabled(
+                    tabsModel.activeModel.repositoryURL == nil
+                        || tabsModel.activeModel.isPlainFolder
+                )
 
                 Divider()
 

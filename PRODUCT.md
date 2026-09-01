@@ -6,11 +6,11 @@ product
 
 ## Users
 
-Developers who want a focused source-control workflow without keeping a full editor open.
+Developers who want a focused source-control workflow without keeping a full editor open, and who need to browse and edit files on remote machines over SSH without setting up Git there first.
 
 ## Product Purpose
 
-Provide a compact native macOS panel for reviewing changes, staging files, committing, syncing, and scanning Git history. Success means the app can stay open beside other work without taking meaningful screen space or attention.
+Provide a compact native macOS panel for reviewing changes, staging files, committing, syncing, and scanning Git history, and a lightweight file browser and editor for local folders and SSH hosts that works with or without a Git repository. Success means the app can stay open beside other work without taking meaningful screen space or attention.
 
 ## Brand Personality
 
