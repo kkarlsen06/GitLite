@@ -476,9 +476,10 @@ private struct RepositoryStatusBar: View {
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .layoutPriority(1)
         }
         .foregroundStyle(AppTheme.secondary)
-        .frame(maxWidth: 180)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .help(activityText)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Repository status: \(activityText)")
