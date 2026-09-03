@@ -225,6 +225,20 @@ final class GitClientTests: XCTestCase {
         )
     }
 
+    func testOrdinaryGitErrorUsesBoundedCommandFailurePresentation() {
+        let error = GitCommandError(
+            command: "git commit -m message",
+            output: String(repeating: "lint warning\n", count: 1_000)
+        )
+
+        let presentation = error.commandFailurePresentation
+        XCTAssertEqual(presentation.title, "Git Command Failed")
+        XCTAssertTrue(presentation.message.contains("Show Details"))
+        XCTAssertFalse(presentation.message.contains("lint warning"))
+        XCTAssertTrue(presentation.details.contains("git commit -m message"))
+        XCTAssertEqual(presentation.details.components(separatedBy: "\n").count, 1_002)
+    }
+
     func testMissingGitLFSErrorUsesActionablePresentation() throws {
         let output = """
         git: 'lfs' is not a git command. See 'git --help'.
@@ -1978,10 +1992,10 @@ final class GitClientTests: XCTestCase {
         [ "$model" = "gpt-5.6-sol" ] || exit 64
         [ "$effort" = 'model_reasoning_effort=xhigh' ] || exit 65
         input="$(cat)"
-        printf '%s' "$input" | grep -q 'only the staged Git diff' || exit 66
+        printf '%s' "$input" | grep -q 'Run `git diff --cached --no-ext-diff --no-color`' || exit 66
         printf '%s' "$input" | grep -q 'Ignore every unstaged modification' || exit 67
         printf '%s' "$input" | grep -q 'Emphasize the graph fix' || exit 68
-        printf '%s' "$input" | grep -q '+staged' || exit 69
+        printf '%s' "$input" | grep -q '+staged' && exit 69
         printf '{"message":"fix: repair graph lanes"}' > "$output"
         printf '{"message":"fix: repair graph lanes"}'
         """ .write(

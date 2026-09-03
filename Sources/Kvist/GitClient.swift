@@ -358,6 +358,25 @@ struct GitCommandError: LocalizedError, Sendable {
         let details: String
     }
 
+    struct CommandFailurePresentation: Equatable, Sendable {
+        let title: String
+        let message: String
+        let details: String
+    }
+
+    var commandFailurePresentation: CommandFailurePresentation {
+        let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return CommandFailurePresentation(
+            title: "Git Command Failed",
+            message: """
+            The Git command could not be completed. Choose Show Details to inspect the full output.
+            """,
+            details: detail.isEmpty
+                ? "Command: \(command)"
+                : "Command: \(command)\n\n\(detail)"
+        )
+    }
+
     var rebaseConflictPresentation: RebaseConflictPresentation? {
         let paths = rebaseConflictPaths
         guard !paths.isEmpty,

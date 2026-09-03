@@ -193,7 +193,12 @@ enum AppDialog {
         guard result.actionIndex == 0, let details else { return }
         let detailsResult = run(
             title: "\(title) Details",
-            message: details,
+            message: "The full command output is available below.",
+            disclosure: AppDialogDisclosure(
+                title: "Output",
+                summary: "Full command output",
+                text: details
+            ),
             actions: [
                 AppDialogAction(title: "Copy Details", role: .secondary),
                 AppDialogAction(title: "OK", role: .primary)

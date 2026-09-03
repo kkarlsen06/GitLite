@@ -4269,7 +4269,12 @@ final class RepositoryModel: ObservableObject {
                     details: presentation.details
                 )
             } else {
-                errorMessage = error.localizedDescription
+                let presentation = gitError.commandFailurePresentation
+                errorPresentation = RepositoryErrorPresentation(
+                    title: presentation.title,
+                    message: presentation.message,
+                    details: presentation.details
+                )
             }
         } else {
             errorMessage = error.localizedDescription
