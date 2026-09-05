@@ -3422,7 +3422,7 @@ private struct ChangesPanel: View {
                 }
 
                 ScrollView {
-                    LazyVStack(spacing: 0) {
+                    LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
                         if !model.staged.isEmpty {
                             FileSection(
                                 title: "Staged Changes",
@@ -4047,7 +4047,17 @@ private struct FileSection: View {
     private let groupsPerPage = 100
 
     var body: some View {
-        VStack(spacing: 0) {
+        Section {
+            if expanded {
+                if changes.count <= directFileLimit {
+                    ForEach(changes) { change in
+                        FileChangeRow(change: change)
+                    }
+                } else {
+                    largeChangesContent
+                }
+            }
+        } header: {
             HStack(spacing: 9) {
                 Button {
                     expanded.toggle()
@@ -4113,7 +4123,7 @@ private struct FileSection: View {
             .frame(height: 33)
             .contentShape(Rectangle())
             .foregroundStyle(AppTheme.primary)
-            .background(hovering ? AppTheme.hover : .clear)
+            .background(hovering ? AppTheme.hover : AppTheme.canvas)
             .onHover { hovering = $0 }
             .contextMenu {
                 Button(title == "Changes" ? "Stage All" : "Unstage All", action: action)
@@ -4156,19 +4166,9 @@ private struct FileSection: View {
                     }
                 }
             }
-
-            if expanded {
-                if changes.count <= directFileLimit {
-                    ForEach(changes) { change in
-                        FileChangeRow(change: change)
-                    }
-                } else {
-                    largeChangesContent
-                }
+            .onChange(of: changes) {
+                normalizePagination()
             }
-        }
-        .onChange(of: changes) {
-            normalizePagination()
         }
     }
 
